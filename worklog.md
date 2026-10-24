@@ -149,3 +149,68 @@ Stage Summary:
   onstart. If permission is denied or the recognizer errors out, the
   error card shows immediately. Stale sessions can no longer interfere
   with new sessions.
+
+---
+Task ID: 7
+Agent: Z.ai main agent
+Task: Continuous-mode mic + modern high-tech UI + million/billion support
+
+Work Log:
+- Fixed "i didn't hear the number on each fragment" root cause:
+  - SpeechRecognition was set to continuous=false, so the browser
+    finalized after every brief pause. Each segment was parsed alone,
+    so connector words ("and", "of", "square", "root", "point")
+    produced "I didn't hear a number!" errors.
+  - Switched to continuous=true so the mic stays open across multiple
+    final results.
+  - onresult now ACCUMULATES all final transcripts into a single
+    string and shows (accumulated + interim) as live feedback. A 1.8s
+    silence timer triggers parseAndStop() once the kid pauses.
+  - If the kid taps Stop before the silence timer fires, onend parses
+    whatever was accumulated so far.
+  - A 'parsed' flag prevents double-processing between silence timer
+    and onend.
+  - Progressive trailing-word drop: if the joined transcript fails to
+    parse, drop 1-3 trailing words and retry (helps with stray "um",
+    "and" at the end of long phrases).
+- Modernized MicButton UI:
+  - 3 concentric pulsing rings (orange/pink/purple) expanding outward
+    while listening, plus an animated glow halo.
+  - Mic icon replaced with animated frequency bars (the modern
+    "voice assistant" look) while listening.
+  - The Listening card now shows an 18-bar animated sound-wave
+    visualisation in rainbow gradient instead of the static ear emoji.
+  - Subtitle hint: "Speak a math problem — take your time, I'm
+    listening!" so the kid knows to keep talking through multi-word
+    numbers.
+- iOS / cross-device support:
+  - continuous=true is required for iOS Safari's webkitSpeechRecognition
+    to keep listening past the first final result.
+  - Improved the unsupported-browser banner to mention Chrome/Edge/
+    Safari and the HTTPS requirement.
+- Long-number parser support:
+  - Added 'million' and 'billion' to NUMBER_WORDS.
+  - Fixed a long-standing scale-accumulation bug in wordsToNumber: the
+    old algorithm conflated current * scale for 'hundred' and 'thousand',
+    so 'two thousand three hundred' produced 2003 instead of 2300, and
+    'three million two hundred thousand' produced nonsense.
+    New algorithm folds current into total at scale words
+    (thousand/million/billion) and uses 'hundred' as a multiplier only.
+  - Extended numberToWords() to handle millions and billions
+    (up to 999,999,999,999) so TTS can speak large answers.
+- Added the "1,234,567" example button showcasing the new large-number
+  support.
+- toggleMic stop branch no longer calls resetForNewCommand — it lets
+  onend parse the accumulated transcript and set the display, avoiding
+  a brief "Tap the microphone" flash before the result shows.
+- Verified: 34/34 parser unit tests pass (added 6 new large-number
+  cases); tsc + eslint clean; the 1,234,567 example button produces the
+  correct result in the browser.
+- Committed 13daec7 and pushed to TahaAC/KIYANFun main (36f6cc2..13daec7)
+
+Stage Summary:
+- Multi-fragment spoken phrases now accumulate into a single transcript
+  before parsing — fixes "i didn't hear the number on each fragment".
+- Mic UI is now high-tech: pulsing rings, frequency bars, sound wave.
+- Continuous mode + HTTPS requirement hint = iOS-friendly.
+- Parser handles up to 999,999,999,999 with correct scale-accumulation.
