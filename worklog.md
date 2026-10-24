@@ -39,3 +39,45 @@ Stage Summary:
 - Voice recognition flow is now robust across repeated sessions
 - Stop button refreshes UI for a new command as requested
 - Fix pushed to GitHub (a2bead0..357d1ea)
+
+---
+Task ID: 4
+Agent: Z.ai main agent
+Task: Complex math support + TTS speaks all numbers + fix mic button second-tap
+
+Work Log:
+- mathParser.ts:
+  - Added preprocessSpecials() handling for 'square root of X', 'X squared',
+    'X cubed', 'X to the power of Y', 'X raised to the Y'
+  - wordsToNumber() now supports 'point' for decimals (e.g. 3.14) and 'and'
+    is silently skipped inside multi-word numbers (one hundred and fifty -> 150)
+  - safeEval() supports '^' as right-associative precedence-3 operator (Math.pow)
+  - New exports: numberToWords, speakDecimal, speakNumber, speakExpression
+  - Reordered parseSpokenMath so replaceOperators runs BEFORE preprocessSpecials
+    so the special-phrase lookaheads can detect operator boundaries
+- page.tsx:
+  - spokenResultText() uses speakExpression + speakNumber so TTS reads
+    'five plus three equals eight' instead of '5 plus 3 equals eight'
+  - Streak-celebration speech uses speakNumber() for the streak count
+  - EquationText pre-computes a superscript flag map (pure render, ESLint-clean)
+    so '5 ^ 2' displays as '5²' with '2' as a CSS superscript
+  - Mic retry: tryStart() retries rec.start() up to 3 times @220ms when the
+    browser throws InvalidStateError (recognizer hasn't released yet) - root
+    cause of the 'can't tap the mic a second time' complaint
+  - toggleMic stop path no longer nulls recRef.current; onend does that only
+    after the browser has fully stopped - closes the race window
+  - 12 example buttons showcase complex cases (squared, cubed, power, sqrt,
+    decimals, multi-word numbers with 'and', mixed precedence)
+  - HelpModal examples updated to mention the new capabilities
+- scripts/test-parser.ts: 28/28 parser unit tests pass
+- tsc + eslint clean on src/
+- Browser verification: all 7 new complex example buttons produce correct
+  results in browser (sqrt(16)=4, 3.14=3.14, 5+3*2=11, 150-75=75, 234=234,
+  2^3=8, 5^2=25)
+- Committed c5aa682 and pushed to TahaAC/KIYANFun main (357d1ea..c5aa682)
+
+Stage Summary:
+- Parser now handles powers, roots, decimals, 'and' in numbers, and
+  multi-step expressions with correct operator precedence
+- TTS announces results entirely in words (both expression and answer)
+- Mic button reliably works on second (and Nth) tap via retry loop

@@ -1,0 +1,1110 @@
+     1→'use client';
+     2→
+     3→import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+     4→import { motion, AnimatePresence } from 'framer-motion';
+     5→import {
+     6→  Mic,
+     7→  MicOff,
+     8→  Star,
+     9→  Flame,
+    10→  Trophy,
+    11→  RotateCcw,
+    12→  Volume2,
+    13→  VolumeX,
+    14→  HelpCircle,
+    15→  Sparkles,
+    16→  X,
+    17→} from 'lucide-react';
+    18→import { Button } from '@/components/ui/button';
+    19→import { Mascot, type MascotMood } from '@/components/kiyan/mascot';
+    20→import { Confetti } from '@/components/kiyan/confetti';
+    21→import { parseSpokenMath, speak, type ParseResult } from '@/lib/mathParser';
+    22→
+    23→// ---- Speech Recognition typings (not in lib.dom.d.ts) ----
+    24→interface SpeechRecognitionAlternative {
+    25→  transcript: string;
+    26→  confidence: number;
+    27→}
+    28→interface SpeechRecognitionResult {
+    29→  readonly length: number;
+    30→  readonly isFinal: boolean;
+    31→  item(index: number): SpeechRecognitionAlternative;
+    32→  [index: number]: SpeechRecognitionAlternative;
+    33→}
+    34→interface SpeechRecognitionResultList {
+    35→  readonly length: number;
+    36→  item(index: number): SpeechRecognitionResult;
+    37→  [index: number]: SpeechRecognitionResult;
+    38→}
+    39→interface SpeechRecognitionEvent extends Event {
+    40→  readonly resultIndex: number;
+    41→  readonly results: SpeechRecognitionResultList;
+    42→}
+    43→interface SpeechRecognitionErrorEvent extends Event {
+    44→  readonly error: string;
+    45→  readonly message: string;
+    46→}
+    47→interface SpeechRecognition extends EventTarget {
+    48→  lang: string;
+    49→  continuous: boolean;
+    50→  interimResults: boolean;
+    51→  maxAlternatives: number;
+    52→  start(): void;
+    53→  stop(): void;
+    54→  abort(): void;
+    55→  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+    56→  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
+    57→  onend: (() => void) | null;
+    58→  onstart: (() => void) | null;
+    59→  onaudiostart: (() => void) | null;
+    60→  onspeechstart: (() => void) | null;
+    61→}
+    62→type SpeechRecognitionConstructor = new () => SpeechRecognition;
+    63→
+    64→declare global {
+    65→  interface Window {
+    66→    SpeechRecognition?: SpeechRecognitionConstructor;
+    67→    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    68→  }
+    69→}
+    70→
+    71→const ENCOURAGEMENTS = [
+    72→  'Awesome!',
+    73→  'Brilliant!',
+    74→  'Way to go!',
+    75→  'Super!',
+    76→  'Fantastic!',
+    77→  'Great job!',
+    78→  'Woohoo!',
+    79→  'Excellent!',
+    80→  'Amazing!',
+    81→  'You rock!',
+    82→  'High five!',
+    83→  'Math star!',
+    84→];
+    85→
+    86→const EXAMPLE_PHRASES: { label: string; text: string }[] = [
+    87→  { label: '5 + 3', text: 'five plus three' },
+    88→  { label: '10 − 4', text: 'ten minus four' },
+    89→  { label: '6 × 7', text: 'six times seven' },
+    90→  { label: '20 ÷ 4', text: 'twenty divided by four' },
+    91→  { label: '12 + 8', text: 'twelve plus eight' },
+    92→  { label: '9 × 9', text: 'nine times nine' },
+    93→  { label: '25 − 5', text: 'twenty five minus five' },
+    94→  { label: '100 + 50', text: 'one hundred plus fifty' },
+    95→];
+    96→
+    97→const RAINBOW_COLORS = [
+    98→  'text-orange-500',
+    99→  'text-amber-500',
+   100→  'text-pink-500',
+   101→  'text-purple-500',
+   102→  'text-green-500',
+   103→  'text-rose-500',
+   104→  'text-yellow-500',
+   105→];
+   106→
+   107→interface DisplayState {
+   108→  expression: string;
+   109→  result: number | null;
+   110→  message: string;
+   111→  error?: string;
+   112→  transcript: string;
+   113→}
+   114→
+   115→const STORAGE_KEY = 'kiyan-state-v1';
+   116→
+   117→interface SavedState {
+   118→  score: number;
+   119→  bestStreak: number;
+   120→  solved: number;
+   121→}
+   122→
+   123→// Cached default snapshot for SSR (must be stable to avoid useSyncExternalStore infinite loop)
+   124→const DEFAULT_SAVED_STATE: SavedState = { score: 0, bestStreak: 0, solved: 0 };
+   125→
+   126→// Module-level cache of the last seen snapshot. useSyncExternalStore requires
+   127→// getSnapshot to return the SAME reference if nothing changed; otherwise it
+   128→// re-renders infinitely. We compute the snapshot once and only swap the
+   129→// reference when the underlying localStorage value actually changes.
+   130→let cachedSavedState: SavedState = DEFAULT_SAVED_STATE;
+   131→
+   132→function readSavedStateRaw(): SavedState {
+   133→  if (typeof window === 'undefined') return DEFAULT_SAVED_STATE;
+   134→  try {
+   135→    const raw = window.localStorage.getItem(STORAGE_KEY);
+   136→    if (!raw) return DEFAULT_SAVED_STATE;
+   137→    const parsed = JSON.parse(raw) as Partial<SavedState>;
+   138→    return {
+   139→      score: parsed.score ?? 0,
+   140→      bestStreak: parsed.bestStreak ?? 0,
+   141→      solved: parsed.solved ?? 0,
+   142→    };
+   143→  } catch {
+   144→    return DEFAULT_SAVED_STATE;
+   145→  }
+   146→}
+   147→
+   148→/**
+   149→ * Returns the cached snapshot of saved state, swapping the cache when the
+   150→ * underlying values change. This stable-reference pattern keeps
+   151→ * useSyncExternalStore happy.
+   152→ */
+   153→function getSavedSnapshot(): SavedState {
+   154→  if (typeof window === 'undefined') return DEFAULT_SAVED_STATE;
+   155→  const next = readSavedStateRaw();
+   156→  if (
+   157→    cachedSavedState.score !== next.score ||
+   158→    cachedSavedState.bestStreak !== next.bestStreak ||
+   159→    cachedSavedState.solved !== next.solved
+   160→  ) {
+   161→    cachedSavedState = next;
+   162→  }
+   163→  return cachedSavedState;
+   164→}
+   165→
+   166→function RainbowText({ text, className }: { text: string; className?: string }) {
+   167→  const chars = text.split('');
+   168→  return (
+   169→    <span className={className} aria-label={text}>
+   170→      {chars.map((c, i) => (
+   171→        <span
+   172→          key={i}
+   173→          className={c.trim() === '' ? '' : RAINBOW_COLORS[i % RAINBOW_COLORS.length]}
+   174→          aria-hidden
+   175→        >
+   176→          {c}
+   177→        </span>
+   178→      ))}
+   179→    </span>
+   180→  );
+   181→}
+   182→
+   183→export default function Home() {
+   184→  const [listening, setListening] = useState(false);
+   185→  const [interim, setInterim] = useState('');
+   186→  const [display, setDisplay] = useState<DisplayState | null>(null);
+   187→  const [mood, setMood] = useState<MascotMood>('idle');
+   188→  // Score, bestStreak, solved are the source of truth from localStorage
+   189→  // (SSR-safe via useSyncExternalStore). Writes go through `updateSaved`.
+   190→  const subscribeSaved = useCallback((cb: () => void) => {
+   191→    if (typeof window === 'undefined') return () => {};
+   192→    window.addEventListener('storage', cb);
+   193→    window.addEventListener('kiyan-state-updated', cb);
+   194→    return () => {
+   195→      window.removeEventListener('storage', cb);
+   196→      window.removeEventListener('kiyan-state-updated', cb);
+   197→    };
+   198→  }, []);
+   199→  const savedState = useSyncExternalStore(
+   200→    subscribeSaved,
+   201→    getSavedSnapshot,
+   202→    () => DEFAULT_SAVED_STATE
+   203→  );
+   204→  const { score, bestStreak, solved } = savedState;
+   205→  // Streak is session-only, not persisted.
+   206→  const [streak, setStreak] = useState(0);
+   207→  const [confettiRun, setConfettiRun] = useState(0);
+   208→  const [muted, setMuted] = useState(false);
+   209→  const [showHelp, setShowHelp] = useState(false);
+   210→  const [showLevelUp, setShowLevelUp] = useState<string | null>(null);
+   211→  const [hintIndex, setHintIndex] = useState(0);
+   212→  const recRef = useRef<SpeechRecognition | null>(null);
+   213→  // Speech is queued here during a voice session and spoken only AFTER the
+   214→  // recognition session has fully ended. Speaking while the mic is open makes
+   215→  // the recognizer transcribe the app's own voice — a major source of
+   216→  // "recognition not working" complaints.
+   217→  const pendingSpeechRef = useRef<string | null>(null);
+   218→  // Auto-returns the result card to the ready state so the app is always
+   219→  // fresh for the next command.
+   220→  const autoClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   221→  // Set when the user deliberately stops listening, so the trailing
+   222→  // 'no-speech' error is suppressed instead of popping an error card.
+   223→  const stopRequestedRef = useRef(false);
+   224→
+   225→  // Helper that writes to localStorage and notifies subscribers.
+   226→  const updateSaved = useCallback((updater: (prev: SavedState) => SavedState) => {
+   227→    if (typeof window === 'undefined') return;
+   228→    try {
+   229→      const current = readSavedStateRaw();
+   230→      const next = updater(current);
+   231→      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+   232→      window.dispatchEvent(new Event('kiyan-state-updated'));
+   233→    } catch {
+   234→      /* ignore */
+   235→    }
+   236→  }, []);
+   237→
+   238→  // Detect support for SpeechRecognition (SSR-safe via useSyncExternalStore)
+   239→  const supported = useSyncExternalStore(
+   240→    () => () => {},
+   241→    () =>
+   242→      typeof window !== 'undefined' &&
+   243→      !!(window.SpeechRecognition || window.webkitSpeechRecognition),
+   244→    () => false
+   245→  );
+   246→
+   247→  // Preload TTS voices (Chrome often loads them asynchronously)
+   248→  useEffect(() => {
+   249→    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+   250→    window.speechSynthesis.getVoices();
+   251→    const handler = () => window.speechSynthesis.getVoices();
+   252→    window.speechSynthesis.addEventListener?.('voiceschanged', handler);
+   253→    return () => window.speechSynthesis.removeEventListener?.('voiceschanged', handler);
+   254→  }, []);
+   255→
+   256→  // Rotate the hint every few seconds when idle
+   257→  useEffect(() => {
+   258→    if (mood !== 'idle') return;
+   259→    const t = setInterval(() => {
+   260→      setHintIndex((i) => (i + 1) % EXAMPLE_PHRASES.length);
+   261→    }, 3500);
+   262→    return () => clearInterval(t);
+   263→  }, [mood]);
+   264→
+   265→  // Cancel any pending auto-clear timer.
+   266→  const cancelAutoClear = useCallback(() => {
+   267→    if (autoClearRef.current) {
+   268→      clearTimeout(autoClearRef.current);
+   269→      autoClearRef.current = null;
+   270→    }
+   271→  }, []);
+   272→
+   273→  // Full reset so the next voice command starts from a clean slate.
+   274→  const resetForNewCommand = useCallback(() => {
+   275→    cancelAutoClear();
+   276→    setDisplay(null);
+   277→    setInterim('');
+   278→    setMood('idle');
+   279→  }, [cancelAutoClear]);
+   280→
+   281→  // Show a friendly error card, then auto-refresh to the ready state.
+   282→  const showErrorCard = useCallback(
+   283→    (message: string, error?: string) => {
+   284→      cancelAutoClear();
+   285→      setMood('oops');
+   286→      setDisplay({ expression: '', result: null, message, transcript: '', error });
+   287→      autoClearRef.current = setTimeout(() => {
+   288→        setDisplay(null);
+   289→        setInterim('');
+   290→        setMood((m) => (m === 'oops' ? 'idle' : m));
+   291→      }, 6000);
+   292→    },
+   293→    [cancelAutoClear]
+   294→  );
+   295→
+   296→  const handleResult = useCallback(
+   297→    (parsed: ParseResult, transcript: string, fromVoice: boolean) => {
+   298→      cancelAutoClear();
+   299→
+   300→      // Queue speech (voice path) or speak immediately (button path).
+   301→      const say = (text: string) => {
+   302→        if (muted) return;
+   303→        if (fromVoice) {
+   304→          pendingSpeechRef.current = pendingSpeechRef.current
+   305→            ? `${pendingSpeechRef.current} ${text}`
+   306→            : text;
+   307→        } else {
+   308→          speak(text, { pitch: 1.3, rate: 0.95 });
+   309→        }
+   310→      };
+   311→
+   312→      if (parsed.result === null || parsed.expression === '') {
+   313→        setStreak(0);
+   314→        showErrorCard(parsed.error ?? "I didn't hear that!", parsed.error);
+   315→        say(parsed.error ?? 'Oops! Try again, buddy!');
+   316→        return;
+   317→      }
+   318→
+   319→      const message = ENCOURAGEMENTS[Math.floor(Math.random() * ENCOURAGEMENTS.length)];
+   320→      setDisplay({
+   321→        expression: parsed.expression,
+   322→        result: parsed.result,
+   323→        message,
+   324→        transcript,
+   325→      });
+   326→      setMood('happy');
+   327→      setConfettiRun((r) => r + 1);
+   328→
+   329→      // Speak the result (queued until the mic is off for voice input).
+   330→      say(spokenResultText(parsed));
+   331→
+   332→      // Gamification: +10 per correct solve, +streak bonus.
+   333→      // Persist score / bestStreak / solved via localStorage.
+   334→      const newStreak = streak + 1;
+   335→      setStreak(newStreak);
+   336→      updateSaved((s) => ({
+   337→        score: s.score + 10 + streak,
+   338→        bestStreak: Math.max(s.bestStreak, newStreak),
+   339→        solved: s.solved + 1,
+   340→      }));
+   341→      // Level-up celebration every 5 streak
+   342→      if (newStreak > 0 && newStreak % 5 === 0) {
+   343→        setShowLevelUp(`Streak ${newStreak}! 🔥`);
+   344→        say(`Wow! Streak of ${newStreak}! You are a math star!`);
+   345→        setTimeout(() => setShowLevelUp(null), 2500);
+   346→      }
+   347→
+   348→      // Auto-refresh back to the ready state shortly after the celebration,
+   349→      // so the next command always starts clean.
+   350→      autoClearRef.current = setTimeout(() => {
+   351→        setDisplay(null);
+   352→        setInterim('');
+   353→        setMood((m) => (m === 'happy' ? 'idle' : m));
+   354→      }, 8000);
+   355→
+   356→      // Return to idle after a beat
+   357→      setTimeout(() => {
+   358→        setMood((m) => (m === 'happy' ? 'idle' : m));
+   359→      }, 2200);
+   360→    },
+   361→    [streak, muted, updateSaved, cancelAutoClear, showErrorCard]
+   362→  );
+   363→
+   364→  const startListening = useCallback(() => {
+   365→    if (typeof window === 'undefined') return;
+   366→    const ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+   367→    if (!ctor) return;
+   368→
+   369→    // Stop any existing instance
+   370→    if (recRef.current) {
+   371→      try {
+   372→        recRef.current.abort();
+   373→      } catch {
+   374→        /* ignore */
+   375→      }
+   376→      recRef.current = null;
+   377→    }
+   378→
+   379→    const rec = new ctor();
+   380→    rec.lang = 'en-US';
+   381→    rec.continuous = false;
+   382→    rec.interimResults = true;
+   383→    rec.maxAlternatives = 3;
+   384→
+   385→    rec.onstart = () => {
+   386→      stopRequestedRef.current = false;
+   387→      pendingSpeechRef.current = null;
+   388→      setListening(true);
+   389→      setMood('listening');
+   390→      setInterim('');
+   391→      // Clear the previous result so the "Listening…" card is always visible.
+   392→      setDisplay(null);
+   393→      // NOTE: no TTS here on purpose — speaking while the mic is open makes
+   394→      // the recognizer hear the app's own voice.
+   395→    };
+   396→
+   397→    rec.onresult = (event: SpeechRecognitionEvent) => {
+   398→      let interimText = '';
+   399→      let finalEvent: SpeechRecognitionResult | null = null;
+   400→      for (let i = event.resultIndex; i < event.results.length; i++) {
+   401→        const r = event.results[i];
+   402→        if (r.isFinal && !finalEvent) finalEvent = r;
+   403→        else if (!r.isFinal) interimText += r[0].transcript;
+   404→      }
+   405→      if (interimText) setInterim(interimText);
+   406→      if (finalEvent) {
+   407→        setInterim('');
+   408→        const transcript = finalEvent[0].transcript.trim();
+   409→        // Try each alternative until one parses cleanly — this makes
+   410→        // recognition far more forgiving of misheard words.
+   411→        let parsed = parseSpokenMath(transcript);
+   412→        for (let a = 1; a < finalEvent.length; a++) {
+   413→          if (parsed.result !== null) break;
+   414→          const altParsed = parseSpokenMath(finalEvent[a].transcript.trim());
+   415→          if (altParsed.result !== null) {
+   416→            parsed = { ...altParsed, spokenInput: transcript };
+   417→          }
+   418→        }
+   419→        handleResult(parsed, transcript, true);
+   420→      }
+   421→    };
+   422→
+   423→    rec.onerror = (event: SpeechRecognitionErrorEvent) => {
+   424→      setListening(false);
+   425→      if (event.error === 'aborted') {
+   426→        // User cancelled — UI already reset, stay quiet.
+   427→        return;
+   428→      }
+   429→      if (stopRequestedRef.current && event.error === 'no-speech') {
+   430→        // Deliberate stop with nothing said — keep the clean refreshed state.
+   431→        return;
+   432→      }
+   433→      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+   434→        showErrorCard(
+   435→          'Microphone is blocked! Ask a grown-up to open this app in a new browser tab, then allow the mic.',
+   436→          'mic-blocked'
+   437→        );
+   438→      } else if (event.error === 'no-speech') {
+   439→        showErrorCard("I didn't hear anything — tap the mic and try again!");
+   440→      } else if (event.error === 'network') {
+   441→        showErrorCard(
+   442→          'The speech service is not reachable right now. Try again, or use the buttons below!'
+   443→        );
+   444→      } else {
+   445→        showErrorCard(`Oops: ${event.error}. Try again!`);
+   446→      }
+   447→    };
+   448→
+   449→    rec.onend = () => {
+   450→      setListening(false);
+   451→      stopRequestedRef.current = false;
+   452→      setMood((m) => (m === 'listening' ? 'idle' : m));
+   453→      // The mic is fully off now — speak anything queued during the session.
+   454→      const queued = pendingSpeechRef.current;
+   455→      pendingSpeechRef.current = null;
+   456→      if (queued) {
+   457→        setTimeout(() => speak(queued, { pitch: 1.3, rate: 0.95 }), 250);
+   458→      }
+   459→    };
+   460→
+   461→    try {
+   462→      rec.start();
+   463→      recRef.current = rec;
+   464→    } catch {
+   465→      // Some browsers throw if start() is called too rapidly
+   466→      setListening(false);
+   467→    }
+   468→  }, [handleResult, cancelAutoClear, showErrorCard]);
+   469→
+   470→  const toggleMic = useCallback(() => {
+   471→    if (listening) {
+   472→      // STOP pressed — finish the session and fully refresh for a new command.
+   473→      stopRequestedRef.current = true;
+   474→      if (recRef.current) {
+   475→        try {
+   476→          // stop() politely finalises any speech already heard (so nothing
+   477→          // the kid said is lost); the UI below resets immediately.
+   478→          recRef.current.stop();
+   479→        } catch {
+   480→          /* ignore */
+   481→        }
+   482→        recRef.current = null;
+   483→      }
+   484→      pendingSpeechRef.current = null;
+   485→      resetForNewCommand();
+   486→      setListening(false);
+   487→    } else {
+   488→      // START pressed — clear any previous result, then listen.
+   489→      resetForNewCommand();
+   490→      startListening();
+   491→    }
+   492→  }, [listening, startListening, resetForNewCommand]);
+   493→
+   494→  // Quick-example buttons (mouse/keyboard fallback)
+   495→  const tryExample = useCallback(
+   496→    (phrase: string) => {
+   497→      // If a voice session is somehow still open, close it quietly first.
+   498→      if (listening && recRef.current) {
+   499→        stopRequestedRef.current = true;
+   500→        try {
+   501→          recRef.current.abort();
+   502→        } catch {
+   503→          /* ignore */
+   504→        }
+   505→        recRef.current = null;
+   506→        setListening(false);
+   507→      }
+   508→      pendingSpeechRef.current = null;
+   509→      const parsed = parseSpokenMath(phrase);
+   510→      handleResult(parsed, phrase, false);
+   511→    },
+   512→    [listening, handleResult]
+   513→  );
+   514→
+   515→  const resetProgress = useCallback(() => {
+   516→    setStreak(0);
+   517→    setDisplay(null);
+   518→    setMood('idle');
+   519→    if (typeof window !== 'undefined') {
+   520→      try {
+   521→        window.localStorage.removeItem(STORAGE_KEY);
+   522→        window.dispatchEvent(new Event('kiyan-state-updated'));
+   523→      } catch {
+   524→        /* ignore */
+   525→      }
+   526→    }
+   527→  }, []);
+   528→
+   529→  const toggleMute = useCallback(() => {
+   530→    setMuted((m) => {
+   531→      const next = !m;
+   532→      if (next && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+   533→        window.speechSynthesis.cancel();
+   534→      }
+   535→      return next;
+   536→    });
+   537→  }, []);
+   538→
+   539→  const micDisabled = supported === false;
+   540→  const currentHint = EXAMPLE_PHRASES[hintIndex];
+   541→
+   542→  return (
+   543→    <div className="min-h-screen relative overflow-hidden bg-gradient-to-br from-amber-200 via-orange-200 to-pink-200">
+   544→      {/* Decorative floating shapes */}
+   545→      <FloatingDecorations />
+   546→
+   547→      <Confetti run={confettiRun} />
+   548→
+   549→      {/* Level-up banner */}
+   550→      <AnimatePresence>
+   551→        {showLevelUp && (
+   552→          <motion.div
+   553→            initial={{ opacity: 0, scale: 0.6, y: -40 }}
+   554→            animate={{ opacity: 1, scale: 1, y: 0 }}
+   555→            exit={{ opacity: 0, scale: 0.6, y: -40 }}
+   556→            className="fixed top-6 left-1/2 -translate-x-1/2 z-40 bg-gradient-to-r from-orange-500 to-pink-500 text-white px-6 py-3 rounded-full text-xl md:text-2xl font-black shadow-2xl border-4 border-white"
+   557→          >
+   558→            {showLevelUp}
+   559→          </motion.div>
+   560→        )}
+   561→      </AnimatePresence>
+   562→
+   563→      <main className="relative z-10 flex min-h-screen flex-col">
+   564→        {/* Header */}
+   565→        <header className="px-4 pt-6 pb-2 md:pt-8 md:px-8">
+   566→          <div className="mx-auto max-w-5xl flex items-center justify-between gap-4 flex-wrap">
+   567→            <div>
+   568→              <h1 className="text-5xl md:text-7xl font-black tracking-tight leading-none drop-shadow-sm">
+   569→                <RainbowText text="KIYAN" />
+   570→              </h1>
+   571→              <p className="text-base md:text-xl font-bold text-purple-700 mt-1">
+   572→                Voice Math Adventure
+   573→              </p>
+   574→            </div>
+   575→
+   576→            <ScorePanel
+   577→              score={score}
+   578→              streak={streak}
+   579→              bestStreak={bestStreak}
+   580→              solved={solved}
+   581→              onReset={resetProgress}
+   582→              muted={muted}
+   583→              onToggleMute={toggleMute}
+   584→              onHelp={() => setShowHelp(true)}
+   585→            />
+   586→          </div>
+   587→        </header>
+   588→
+   589→        {/* Main content */}
+   590→        <section className="flex-1 px-4 md:px-8 pb-6 flex flex-col items-center gap-6 md:gap-8">
+   591→          {/* Mascot */}
+   592→          <div className="mt-2 md:mt-4">
+   593→            <Mascot mood={mood} />
+   594→          </div>
+   595→
+   596→          {/* Result display */}
+   597→          <ResultCard display={display} interim={interim} listening={listening} />
+   598→
+   599→          {/* Microphone button */}
+   600→          <MicButton
+   601→            listening={listening}
+   602→            disabled={micDisabled}
+   603→            onClick={toggleMic}
+   604→          />
+   605→
+   606→          {/* Hint */}
+   607→          {!display && (
+   608→            <motion.div
+   609→              key={currentHint.text}
+   610→              initial={{ opacity: 0, y: 6 }}
+   611→              animate={{ opacity: 1, y: 0 }}
+   612→              className="text-center text-sm md:text-base font-bold text-purple-700/90 bg-white/70 backdrop-blur px-4 py-2 rounded-full border-2 border-purple-200"
+   613→            >
+   614→              Try saying: <span className="text-pink-600">“{currentHint.text}”</span>
+   615→            </motion.div>
+   616→          )}
+   617→
+   618→          {/* Example chips */}
+   619→          <div className="w-full max-w-2xl">
+   620→            <p className="text-center text-xs md:text-sm font-bold uppercase tracking-wider text-purple-600/80 mb-3">
+   621→              Or tap a quick example
+   622→            </p>
+   623→            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 md:gap-3">
+   624→              {EXAMPLE_PHRASES.map((ex) => (
+   625→                <button
+   626→                  key={ex.text}
+   627→                  onClick={() => tryExample(ex.text)}
+   628→                  className="group rounded-2xl bg-white/80 backdrop-blur border-2 border-white hover:border-pink-300 hover:bg-white transition-all px-3 py-3 md:py-4 font-black text-lg md:text-2xl text-purple-700 shadow-sm hover:shadow-md active:scale-95"
+   629→                >
+   630→                  {ex.label}
+   631→                </button>
+   632→              ))}
+   633→            </div>
+   634→          </div>
+   635→        </section>
+   636→
+   637→        {/* Footer */}
+   638→        <footer className="mt-auto px-4 md:px-8 pb-4 pt-2 text-center">
+   639→          <p className="text-xs md:text-sm font-semibold text-purple-700/70">
+   640→            Made with love for Kiyan · Speak clearly and have fun!
+   641→          </p>
+   642→        </footer>
+   643→      </main>
+   644→
+   645→      {/* Unsupported browser banner */}
+   646→      {micDisabled && (
+   647→        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 bg-white/95 backdrop-blur px-4 py-2 rounded-full text-sm font-bold text-orange-600 border-2 border-orange-300 shadow-lg">
+   648→          Voice input isn’t available here — use the example buttons below!
+   649→        </div>
+   650→      )}
+   651→
+   652→      {/* Help modal */}
+   653→      <HelpModal open={showHelp} onClose={() => setShowHelp(false)} />
+   654→    </div>
+   655→  );
+   656→}
+   657→
+   658→/* ---------- Sub-components ---------- */
+   659→
+   660→function ScorePanel({
+   661→  score,
+   662→  streak,
+   663→  bestStreak,
+   664→  solved,
+   665→  onReset,
+   666→  muted,
+   667→  onToggleMute,
+   668→  onHelp,
+   669→}: {
+   670→  score: number;
+   671→  streak: number;
+   672→  bestStreak: number;
+   673→  solved: number;
+   674→  onReset: () => void;
+   675→  muted: boolean;
+   676→  onToggleMute: () => void;
+   677→  onHelp: () => void;
+   678→}) {
+   679→  return (
+   680→    <div className="flex items-center gap-2 md:gap-3 flex-wrap justify-end">
+   681→      <Stat icon={<Star className="text-yellow-500" size={18} fill="currentColor" />} label="Points" value={score} color="bg-yellow-100 border-yellow-300 text-yellow-700" />
+   682→      <Stat icon={<Flame className="text-orange-500" size={18} fill="currentColor" />} label="Streak" value={streak} color="bg-orange-100 border-orange-300 text-orange-700" />
+   683→      <Stat icon={<Trophy className="text-purple-500" size={18} fill="currentColor" />} label="Best" value={bestStreak} color="bg-purple-100 border-purple-300 text-purple-700" />
+   684→      <Stat icon={<Sparkles className="text-pink-500" size={18} fill="currentColor" />} label="Solved" value={solved} color="bg-pink-100 border-pink-300 text-pink-700" />
+   685→      <div className="flex gap-1">
+   686→        <Button
+   687→          variant="ghost"
+   688→          size="icon"
+   689→          onClick={onToggleMute}
+   690→          aria-label={muted ? 'Turn sound on' : 'Mute sound'}
+   691→          className="bg-white/80 border-2 border-purple-200 hover:bg-white hover:border-purple-300 rounded-xl"
+   692→        >
+   693→          {muted ? <VolumeX className="text-purple-500" /> : <Volume2 className="text-purple-500" />}
+   694→        </Button>
+   695→        <Button
+   696→          variant="ghost"
+   697→          size="icon"
+   698→          onClick={onHelp}
+   699→          aria-label="How to play"
+   700→          className="bg-white/80 border-2 border-purple-200 hover:bg-white hover:border-purple-300 rounded-xl"
+   701→        >
+   702→          <HelpCircle className="text-purple-500" />
+   703→        </Button>
+   704→        <Button
+   705→          variant="ghost"
+   706→          size="icon"
+   707→          onClick={onReset}
+   708→          aria-label="Reset progress"
+   709→          className="bg-white/80 border-2 border-purple-200 hover:bg-white hover:border-purple-300 rounded-xl"
+   710→        >
+   711→          <RotateCcw className="text-purple-500" />
+   712→        </Button>
+   713→      </div>
+   714→    </div>
+   715→  );
+   716→}
+   717→
+   718→function Stat({
+   719→  icon,
+   720→  label,
+   721→  value,
+   722→  color,
+   723→}: {
+   724→  icon: React.ReactNode;
+   725→  label: string;
+   726→  value: number;
+   727→  color: string;
+   728→}) {
+   729→  return (
+   730→    <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-2xl border-2 font-black ${color}`} title={label}>
+   731→      {icon}
+   732→      <span className="text-base md:text-lg tabular-nums">{value}</span>
+   733→      <span className="sr-only">{label}</span>
+   734→    </div>
+   735→  );
+   736→}
+   737→
+   738→function ResultCard({
+   739→  display,
+   740→  interim,
+   741→  listening,
+   742→}: {
+   743→  display: DisplayState | null;
+   744→  interim: string;
+   745→  listening: boolean;
+   746→}) {
+   747→  return (
+   748→    <div className="w-full max-w-2xl min-h-[200px] flex items-center justify-center">
+   749→      <AnimatePresence mode="wait">
+   750→        {!display && !listening && !interim && (
+   751→          <motion.div
+   752→            key="empty"
+   753→            initial={{ opacity: 0, y: 10 }}
+   754→            animate={{ opacity: 1, y: 0 }}
+   755→            exit={{ opacity: 0, y: -10 }}
+   756→            className="w-full rounded-3xl bg-white/70 backdrop-blur border-4 border-dashed border-purple-300 p-8 text-center"
+   757→          >
+   758→            <p className="text-xl md:text-2xl font-black text-purple-700">
+   759→              Tap the microphone
+   760→            </p>
+   761→            <p className="text-base md:text-lg font-bold text-purple-500 mt-2">
+   762→              Say a math problem like “five plus three”
+   763→            </p>
+   764→          </motion.div>
+   765→        )}
+   766→
+   767→        {(listening || interim) && !display && (
+   768→          <motion.div
+   769→            key="listening"
+   770→            initial={{ opacity: 0, scale: 0.95 }}
+   771→            animate={{ opacity: 1, scale: 1 }}
+   772→            exit={{ opacity: 0, scale: 0.95 }}
+   773→            className="w-full rounded-3xl bg-white/80 backdrop-blur border-4 border-orange-300 p-8 text-center shadow-lg"
+   774→          >
+   775→            <motion.div
+   776→              animate={{ scale: [1, 1.1, 1] }}
+   777→              transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut' }}
+   778→              className="text-4xl md:text-5xl mb-3"
+   779→              aria-hidden
+   780→            >
+   781→              👂
+   782→            </motion.div>
+   783→            <p className="text-xl md:text-2xl font-black text-orange-600">
+   784→              Listening…
+   785→            </p>
+   786→            {interim && (
+   787→              <p className="text-base md:text-lg font-bold text-purple-600 mt-2 italic">
+   788→                “{interim}”
+   789→              </p>
+   790→            )}
+   791→          </motion.div>
+   792→        )}
+   793→
+   794→        {display && (
+   795→          <motion.div
+   796→            key={display.expression + display.result + display.message}
+   797→            initial={{ opacity: 0, scale: 0.85, y: 20 }}
+   798→            animate={{ opacity: 1, scale: 1, y: 0 }}
+   799→            exit={{ opacity: 0, scale: 0.85, y: -20 }}
+   800→            transition={{ type: 'spring', stiffness: 220, damping: 18 }}
+   801→            className={`w-full rounded-3xl p-6 md:p-8 text-center shadow-xl border-4 ${
+   802→              display.result !== null
+   803→                ? 'bg-white/95 border-green-300'
+   804→                : 'bg-white/95 border-orange-300'
+   805→            }`}
+   806→          >
+   807→            {display.transcript && (
+   808→              <p className="text-xs md:text-sm font-bold uppercase tracking-wider text-purple-500/80 mb-2">
+   809→                You said
+   810→              </p>
+   811→            )}
+   812→            {display.transcript && (
+   813→              <p className="text-base md:text-lg font-bold text-purple-700 italic mb-3">
+   814→                “{display.transcript}”
+   815→              </p>
+   816→            )}
+   817→
+   818→            {display.result !== null ? (
+   819→              <motion.div
+   820→                initial={{ scale: 0.7, opacity: 0 }}
+   821→                animate={{ scale: 1, opacity: 1 }}
+   822→                transition={{ delay: 0.1, type: 'spring', stiffness: 260, damping: 14 }}
+   823→                className="flex flex-col items-center gap-2"
+   824→              >
+   825→                <div className="text-4xl md:text-6xl font-black tracking-tight flex flex-wrap items-center justify-center gap-2">
+   826→                  <EquationText expression={display.expression} result={display.result} />
+   827→                </div>
+   828→                <p className="text-2xl md:text-3xl font-black text-green-600 mt-2">
+   829→                  {display.message}
+   830→                </p>
+   831→              </motion.div>
+   832→            ) : (
+   833→              <p className="text-xl md:text-3xl font-black text-orange-600">
+   834→                {display.message}
+   835→              </p>
+   836→            )}
+   837→          </motion.div>
+   838→        )}
+   839→      </AnimatePresence>
+   840→    </div>
+   841→  );
+   842→}
+   843→
+   844→function EquationText({ expression, result }: { expression: string; result: number }) {
+   845→  // Split expression into tokens so we can color each number/operator.
+   846→  const tokens = useMemo(() => {
+   847→    return expression
+   848→      .split(/(\s+|×|÷|−|\+|=|\d+(?:\.\d+)?)/g)
+   849→      .filter((t) => t.trim() !== '');
+   850→  }, [expression]);
+   851→
+   852→  const resultStr = Number.isInteger(result) ? String(result) : result.toFixed(2);
+   853→
+   854→  return (
+   855→    <>
+   856→      {tokens.map((t, i) => {
+   857→        const isOp = ['+', '−', '×', '÷', '='].includes(t);
+   858→        return (
+   859→          <span
+   860→            key={i}
+   861→            className={
+   862→              isOp
+   863→                ? 'text-purple-500 px-1'
+   864→                : RAINBOW_COLORS[i % RAINBOW_COLORS.length]
+   865→            }
+   866→          >
+   867→            {t}
+   868→          </span>
+   869→        );
+   870→      })}
+   871→      <span className="text-purple-500 px-1">=</span>
+   872→      <motion.span
+   873→        initial={{ scale: 1.4 }}
+   874→        animate={{ scale: 1 }}
+   875→        transition={{ type: 'spring', stiffness: 300, damping: 10 }}
+   876→        className="text-green-600 px-2 underline decoration-wavy decoration-green-400"
+   877→      >
+   878→        {resultStr}
+   879→      </motion.span>
+   880→    </>
+   881→  );
+   882→}
+   883→
+   884→function MicButton({
+   885→  listening,
+   886→  disabled,
+   887→  onClick,
+   888→}: {
+   889→  listening: boolean;
+   890→  disabled: boolean;
+   891→  onClick: () => void;
+   892→}) {
+   893→  return (
+   894→    <div className="relative flex flex-col items-center gap-2">
+   895→      <motion.div
+   896→        animate={
+   897→          listening
+   898→            ? { scale: [1, 1.15, 1] }
+   899→            : { scale: 1 }
+   900→        }
+   901→        transition={{ duration: 0.8, repeat: listening ? Infinity : 0, ease: 'easeInOut' }}
+   902→        className="absolute -inset-3 rounded-full bg-gradient-to-r from-orange-400 to-pink-400 blur-xl opacity-60"
+   903→      />
+   904→      <motion.button
+   905→        type="button"
+   906→        onClick={onClick}
+   907→        disabled={disabled}
+   908→        whileTap={{ scale: 0.92 }}
+   909→        whileHover={{ scale: 1.05 }}
+   910→        aria-label={listening ? 'Stop listening' : 'Tap to speak'}
+   911→        className={`relative flex items-center justify-center w-24 h-24 md:w-32 md:h-32 rounded-full text-white shadow-2xl border-4 border-white transition-colors ${
+   912→          listening
+   913→            ? 'bg-gradient-to-br from-red-500 to-orange-500'
+   914→            : 'bg-gradient-to-br from-orange-500 to-pink-500'
+   915→        } ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+   916→      >
+   917→        {listening ? (
+   918→          <MicOff className="w-10 h-10 md:w-14 md:h-14" />
+   919→        ) : (
+   920→          <Mic className="w-10 h-10 md:w-14 md:h-14" />
+   921→        )}
+   922→      </motion.button>
+   923→      <p className="text-sm md:text-base font-black text-purple-700">
+   924→        {listening ? 'Tap to stop' : 'Tap to speak'}
+   925→      </p>
+   926→    </div>
+   927→  );
+   928→}
+   929→
+   930→function HelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+   931→  return (
+   932→    <AnimatePresence>
+   933→      {open && (
+   934→        <motion.div
+   935→          initial={{ opacity: 0 }}
+   936→          animate={{ opacity: 1 }}
+   937→          exit={{ opacity: 0 }}
+   938→          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm"
+   939→          onClick={onClose}
+   940→        >
+   941→          <motion.div
+   942→            initial={{ scale: 0.9, opacity: 0, y: 20 }}
+   943→            animate={{ scale: 1, opacity: 1, y: 0 }}
+   944→            exit={{ scale: 0.9, opacity: 0, y: 20 }}
+   945→            onClick={(e) => e.stopPropagation()}
+   946→            className="bg-white rounded-3xl max-w-md w-full p-6 md:p-8 shadow-2xl border-4 border-purple-200 max-h-[85vh] overflow-y-auto"
+   947→          >
+   948→            <div className="flex items-center justify-between mb-4">
+   949→              <h2 className="text-2xl md:text-3xl font-black text-purple-700">
+   950→                How to Play 🚀
+   951→              </h2>
+   952→              <button
+   953→                onClick={onClose}
+   954→                aria-label="Close help"
+   955→                className="p-1 rounded-full hover:bg-purple-100"
+   956→              >
+   957→                <X className="text-purple-500" />
+   958→              </button>
+   959→            </div>
+   960→
+   961→            <div className="space-y-4 text-purple-900">
+   962→              <div>
+   963→                <h3 className="text-lg font-black text-pink-600 mb-1">1. Tap the mic</h3>
+   964→                <p className="font-semibold">
+   965→                  Press the big round microphone button. When it turns red, Kiyan is listening!
+   966→                </p>
+   967→              </div>
+   968→
+   969→              <div>
+   970→                <h3 className="text-lg font-black text-orange-600 mb-1">2. Say a math problem</h3>
+   971→                <p className="font-semibold mb-2">Examples:</p>
+   972→                <ul className="font-semibold space-y-1 text-sm">
+   973→                  <li>• “five plus three”</li>
+   974→                  <li>• “ten minus four”</li>
+   975→                  <li>• “six times seven”</li>
+   976→                  <li>• “twenty divided by four”</li>
+   977→                  <li>• “one hundred plus fifty”</li>
+   978→                </ul>
+   979→              </div>
+   980→
+   981→              <div>
+   982→                <h3 className="text-lg font-black text-green-600 mb-1">3. Hear the answer!</h3>
+   983→                <p className="font-semibold">
+   984→                  The robot reads the answer out loud and throws a confetti party. 🎉 Then it
+   985→                  gets ready for your next question automatically!
+   986→                </p>
+   987→              </div>
+   988→
+   989→              <div>
+   990→                <h3 className="text-lg font-black text-purple-600 mb-1">4. Build a streak!</h3>
+   991→                <p className="font-semibold">
+   992→                  Solve several in a row to grow your streak and earn bonus points. Hit a streak of 5 for a surprise!
+   993→                </p>
+   994→              </div>
+   995→
+   996→              <div className="bg-amber-50 border-2 border-amber-200 rounded-2xl p-3">
+   997→                <p className="font-bold text-amber-700 text-sm">
+   998→                  💡 Tips: Speak clearly and not too fast. Tap the mic again while listening to
+   999→                  stop and start fresh. If the mic is blocked, use the example buttons instead!
+  1000→                </p>
+  1001→              </div>
+  1002→            </div>
+  1003→
+  1004→            <Button
+  1005→              onClick={onClose}
+  1006→              className="w-full mt-6 bg-gradient-to-r from-orange-500 to-pink-500 hover:from-orange-600 hover:to-pink-600 text-white font-black text-lg h-12 rounded-2xl"
+  1007→            >
+  1008→              Let&apos;s play!
+  1009→            </Button>
+  1010→          </motion.div>
+  1011→        </motion.div>
+  1012→      )}
+  1013→    </AnimatePresence>
+  1014→  );
+  1015→}
+  1016→
+  1017→// Deterministic PRNG (mulberry32) so the floating decorations are computed
+  1018→// identically on the server and the client — no hydration mismatch, and
+  1019→// no need to setState-after-mount.
+  1020→function mulberry32(seed: number) {
+  1021→  let a = seed >>> 0;
+  1022→  return () => {
+  1023→    a = (a + 0x6d2b79f5) >>> 0;
+  1024→    let t = a;
+  1025→    t = Math.imul(t ^ (t >>> 15), t | 1);
+  1026→    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  1027→    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  1028→  };
+  1029→}
+  1030→
+  1031→const FLOATING_DECORATIONS = (() => {
+  1032→  const shapes = ['+', '−', '×', '÷', '★', '1', '2', '3', '5', '7', '8'];
+  1033→  const rand = mulberry32(42);
+  1034→  return Array.from({ length: 14 }).map((_, i) => ({
+  1035→    id: i,
+  1036→    left: rand() * 100,
+  1037→    top: rand() * 100,
+  1038→    size: 24 + rand() * 36,
+  1039→    delay: rand() * 4,
+  1040→    duration: 4 + rand() * 4,
+  1041→    shape: shapes[i % shapes.length],
+  1042→    color: RAINBOW_COLORS[i % RAINBOW_COLORS.length],
+  1043→  }));
+  1044→})();
+  1045→
+  1046→function FloatingDecorations() {
+  1047→  return (
+  1048→    <div aria-hidden className="absolute inset-0 pointer-events-none overflow-hidden">
+  1049→      {FLOATING_DECORATIONS.map((it) => (
+  1050→        <motion.span
+  1051→          key={it.id}
+  1052→          className={`absolute font-black opacity-30 ${it.color}`}
+  1053→          style={{ left: `${it.left}%`, top: `${it.top}%`, fontSize: it.size }}
+  1054→          animate={{
+  1055→            y: [0, -20, 0],
+  1056→            rotate: [0, 15, -15, 0],
+  1057→          }}
+  1058→          transition={{
+  1059→            duration: it.duration,
+  1060→            delay: it.delay,
+  1061→            repeat: Infinity,
+  1062→            ease: 'easeInOut',
+  1063→          }}
+  1064→        >
+  1065→          {it.shape}
+  1066→        </motion.span>
+  1067→      ))}
+  1068→    </div>
+  1069→  );
+  1070→}
+  1071→
+  1072→/* ---------- Helpers ---------- */
+  1073→
+  1074→function spokenResultText(parsed: ParseResult): string {
+  1075→  if (parsed.result === null) return '';
+  1076→  const r = parsed.result;
+  1077→  const rStr = Number.isInteger(r) ? numberToWords(r) : r.toFixed(2);
+  1078→  return `${parsed.expression.replace(/×/g, 'times').replace(/÷/g, 'divided by').replace(/−/g, 'minus')} equals ${rStr}.`;
+  1079→}
+  1080→
+  1081→const NUM_WORDS_UNDER_100: string[] = [
+  1082→  'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+  1083→  'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
+  1084→  'seventeen', 'eighteen', 'nineteen',
+  1085→];
+  1086→const TENS: string[] = [
+  1087→  '', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety',
+  1088→];
+  1089→
+  1090→function numberToWords(n: number): string {
+  1091→  if (n < 0) return 'negative ' + numberToWords(-n);
+  1092→  if (n < 20) return NUM_WORDS_UNDER_100[n];
+  1093→  if (n < 100) {
+  1094→    const t = Math.floor(n / 10);
+  1095→    const r = n % 10;
+  1096→    return r === 0 ? TENS[t] : `${TENS[t]} ${NUM_WORDS_UNDER_100[r]}`;
+  1097→  }
+  1098→  if (n < 1000) {
+  1099→    const h = Math.floor(n / 100);
+  1100→    const r = n % 100;
+  1101→    return r === 0 ? `${NUM_WORDS_UNDER_100[h]} hundred` : `${NUM_WORDS_UNDER_100[h]} hundred ${numberToWords(r)}`;
+  1102→  }
+  1103→  if (n < 1_000_000) {
+  1104→    const th = Math.floor(n / 1000);
+  1105→    const r = n % 1000;
+  1106→    return r === 0 ? `${numberToWords(th)} thousand` : `${numberToWords(th)} thousand ${numberToWords(r)}`;
+  1107→  }
+  1108→  return String(n);
+  1109→}
+  1110→
