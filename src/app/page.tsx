@@ -18,7 +18,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Mascot, type MascotMood } from '@/components/kiyan/mascot';
 import { Confetti } from '@/components/kiyan/confetti';
-import { parseSpokenMath, speak, type ParseResult } from '@/lib/mathParser';
+import { parseSpokenMath, speak, speakExpression, speakNumber, type ParseResult } from '@/lib/mathParser';
 
 // ---- Speech Recognition typings (not in lib.dom.d.ts) ----
 interface SpeechRecognitionAlternative {
@@ -88,10 +88,14 @@ const EXAMPLE_PHRASES: { label: string; text: string }[] = [
   { label: '10 − 4', text: 'ten minus four' },
   { label: '6 × 7', text: 'six times seven' },
   { label: '20 ÷ 4', text: 'twenty divided by four' },
-  { label: '12 + 8', text: 'twelve plus eight' },
-  { label: '9 × 9', text: 'nine times nine' },
-  { label: '25 − 5', text: 'twenty five minus five' },
-  { label: '100 + 50', text: 'one hundred plus fifty' },
+  { label: '150 − 75', text: 'one hundred and fifty minus seventy five' },
+  { label: '5²', text: 'five squared' },
+  { label: '2³', text: 'two cubed' },
+  { label: '2^3', text: 'two to the power of three' },
+  { label: '√16', text: 'square root of sixteen' },
+  { label: '3.14', text: 'three point one four' },
+  { label: '5 + 3×2', text: 'five plus three times two' },
+  { label: '234', text: 'two hundred and thirty four' },
 ];
 
 const RAINBOW_COLORS = [
@@ -341,7 +345,7 @@ export default function Home() {
       // Level-up celebration every 5 streak
       if (newStreak > 0 && newStreak % 5 === 0) {
         setShowLevelUp(`Streak ${newStreak}! 🔥`);
-        say(`Wow! Streak of ${newStreak}! You are a math star!`);
+        say(`Wow! Streak of ${speakNumber(newStreak)}! You are a math star!`);
         setTimeout(() => setShowLevelUp(null), 2500);
       }
 
@@ -366,7 +370,7 @@ export default function Home() {
     const ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!ctor) return;
 
-    // Stop any existing instance
+    // Abort any existing instance (shouldn't normally happen, but be safe).
     if (recRef.current) {
       try {
         recRef.current.abort();
@@ -376,110 +380,144 @@ export default function Home() {
       recRef.current = null;
     }
 
-    const rec = new ctor();
-    rec.lang = 'en-US';
-    rec.continuous = false;
-    rec.interimResults = true;
-    rec.maxAlternatives = 3;
+    // Some browsers throw from start() when it's called too quickly after
+    // a previous stop() — the underlying recognizer hasn't released yet.
+    // Retry a few times with a short delay so the second (and Nth) tap
+    // always works. This is the root cause of the "I can't tap the mic
+    // a second time" complaint.
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 220;
+    let cancelled = false;
 
-    rec.onstart = () => {
-      stopRequestedRef.current = false;
-      pendingSpeechRef.current = null;
-      setListening(true);
-      setMood('listening');
-      setInterim('');
-      // Clear the previous result so the "Listening…" card is always visible.
-      setDisplay(null);
-      // NOTE: no TTS here on purpose — speaking while the mic is open makes
-      // the recognizer hear the app's own voice.
-    };
+    const buildRec = (): SpeechRecognition => {
+      const rec = new ctor();
+      rec.lang = 'en-US';
+      rec.continuous = false;
+      rec.interimResults = true;
+      rec.maxAlternatives = 3;
 
-    rec.onresult = (event: SpeechRecognitionEvent) => {
-      let interimText = '';
-      let finalEvent: SpeechRecognitionResult | null = null;
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const r = event.results[i];
-        if (r.isFinal && !finalEvent) finalEvent = r;
-        else if (!r.isFinal) interimText += r[0].transcript;
-      }
-      if (interimText) setInterim(interimText);
-      if (finalEvent) {
+      rec.onstart = () => {
+        stopRequestedRef.current = false;
+        pendingSpeechRef.current = null;
+        setListening(true);
+        setMood('listening');
         setInterim('');
-        const transcript = finalEvent[0].transcript.trim();
-        // Try each alternative until one parses cleanly — this makes
-        // recognition far more forgiving of misheard words.
-        let parsed = parseSpokenMath(transcript);
-        for (let a = 1; a < finalEvent.length; a++) {
-          if (parsed.result !== null) break;
-          const altParsed = parseSpokenMath(finalEvent[a].transcript.trim());
-          if (altParsed.result !== null) {
-            parsed = { ...altParsed, spokenInput: transcript };
-          }
+        // Clear the previous result so the "Listening…" card is always visible.
+        setDisplay(null);
+        // NOTE: no TTS here on purpose — speaking while the mic is open makes
+        // the recognizer hear the app's own voice.
+      };
+
+      rec.onresult = (event: SpeechRecognitionEvent) => {
+        let interimText = '';
+        let finalEvent: SpeechRecognitionResult | null = null;
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const r = event.results[i];
+          if (r.isFinal && !finalEvent) finalEvent = r;
+          else if (!r.isFinal) interimText += r[0].transcript;
         }
-        handleResult(parsed, transcript, true);
+        if (interimText) setInterim(interimText);
+        if (finalEvent) {
+          setInterim('');
+          const transcript = finalEvent[0].transcript.trim();
+          // Try each alternative until one parses cleanly — this makes
+          // recognition far more forgiving of misheard words.
+          let parsed = parseSpokenMath(transcript);
+          for (let a = 1; a < finalEvent.length; a++) {
+            if (parsed.result !== null) break;
+            const altParsed = parseSpokenMath(finalEvent[a].transcript.trim());
+            if (altParsed.result !== null) {
+              parsed = { ...altParsed, spokenInput: transcript };
+            }
+          }
+          handleResult(parsed, transcript, true);
+        }
+      };
+
+      rec.onerror = (event: SpeechRecognitionErrorEvent) => {
+        setListening(false);
+        if (event.error === 'aborted') {
+          return;
+        }
+        if (stopRequestedRef.current && event.error === 'no-speech') {
+          return;
+        }
+        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+          showErrorCard(
+            'Microphone is blocked! Ask a grown-up to open this app in a new browser tab, then allow the mic.',
+            'mic-blocked'
+          );
+        } else if (event.error === 'no-speech') {
+          showErrorCard("I didn't hear anything — tap the mic and try again!");
+        } else if (event.error === 'network') {
+          showErrorCard(
+            'The speech service is not reachable right now. Try again, or use the buttons below!'
+          );
+        } else {
+          showErrorCard(`Oops: ${event.error}. Try again!`);
+        }
+      };
+
+      rec.onend = () => {
+        // IMPORTANT: null out the ref HERE, after the browser has fully
+        // released the recognizer. Doing it earlier in toggleMic leaves
+        // a window where the next start() throws because the engine is
+        // still tearing down.
+        if (recRef.current === rec) recRef.current = null;
+        setListening(false);
+        stopRequestedRef.current = false;
+        setMood((m) => (m === 'listening' ? 'idle' : m));
+        // The mic is fully off now — speak anything queued during the session.
+        const queued = pendingSpeechRef.current;
+        pendingSpeechRef.current = null;
+        if (queued) {
+          setTimeout(() => speak(queued, { pitch: 1.3, rate: 0.95 }), 250);
+        }
+      };
+
+      return rec;
+    };
+
+    const tryStart = (retriesLeft: number) => {
+      if (cancelled) return;
+      const rec = buildRec();
+      try {
+        rec.start();
+        recRef.current = rec;
+      } catch {
+        // Browser hasn't released the previous recognizer yet — retry.
+        if (retriesLeft > 0) {
+          setTimeout(() => tryStart(retriesLeft - 1), RETRY_DELAY_MS);
+        } else {
+          setListening(false);
+          showErrorCard(
+            'The mic is taking a moment to wake up. Tap the mic again!'
+          );
+        }
       }
     };
 
-    rec.onerror = (event: SpeechRecognitionErrorEvent) => {
-      setListening(false);
-      if (event.error === 'aborted') {
-        // User cancelled — UI already reset, stay quiet.
-        return;
-      }
-      if (stopRequestedRef.current && event.error === 'no-speech') {
-        // Deliberate stop with nothing said — keep the clean refreshed state.
-        return;
-      }
-      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-        showErrorCard(
-          'Microphone is blocked! Ask a grown-up to open this app in a new browser tab, then allow the mic.',
-          'mic-blocked'
-        );
-      } else if (event.error === 'no-speech') {
-        showErrorCard("I didn't hear anything — tap the mic and try again!");
-      } else if (event.error === 'network') {
-        showErrorCard(
-          'The speech service is not reachable right now. Try again, or use the buttons below!'
-        );
-      } else {
-        showErrorCard(`Oops: ${event.error}. Try again!`);
-      }
-    };
+    tryStart(MAX_RETRIES);
 
-    rec.onend = () => {
-      setListening(false);
-      stopRequestedRef.current = false;
-      setMood((m) => (m === 'listening' ? 'idle' : m));
-      // The mic is fully off now — speak anything queued during the session.
-      const queued = pendingSpeechRef.current;
-      pendingSpeechRef.current = null;
-      if (queued) {
-        setTimeout(() => speak(queued, { pitch: 1.3, rate: 0.95 }), 250);
-      }
+    // Best-effort cleanup if the component unmounts during retries.
+    return () => {
+      cancelled = true;
     };
-
-    try {
-      rec.start();
-      recRef.current = rec;
-    } catch {
-      // Some browsers throw if start() is called too rapidly
-      setListening(false);
-    }
-  }, [handleResult, cancelAutoClear, showErrorCard]);
+  }, [handleResult, showErrorCard]);
 
   const toggleMic = useCallback(() => {
     if (listening) {
-      // STOP pressed — finish the session and fully refresh for a new command.
+      // STOP pressed — politely finalise any speech already heard, then
+      // fully refresh the UI for a new command. We do NOT null out
+      // recRef.current here; onend does that once the browser has
+      // fully stopped. This is what makes the next tap work reliably.
       stopRequestedRef.current = true;
       if (recRef.current) {
         try {
-          // stop() politely finalises any speech already heard (so nothing
-          // the kid said is lost); the UI below resets immediately.
           recRef.current.stop();
         } catch {
           /* ignore */
         }
-        recRef.current = null;
       }
       pendingSpeechRef.current = null;
       resetForNewCommand();
@@ -843,10 +881,22 @@ function ResultCard({
 
 function EquationText({ expression, result }: { expression: string; result: number }) {
   // Split expression into tokens so we can color each number/operator.
-  const tokens = useMemo(() => {
-    return expression
-      .split(/(\s+|×|÷|−|\+|=|\d+(?:\.\d+)?)/g)
+  // Also recognise `^` for powers so the next numeric token renders as a
+  // superscript. Pre-compute the flags OUTSIDE the JSX map so render stays
+  // pure (no mutation during render).
+  const { tokens, superscriptFlags } = useMemo(() => {
+    const rawTokens = expression
+      .split(/(\s+|×|÷|−|\+|=|\^|\d+(?:\.\d+)?)/g)
       .filter((t) => t.trim() !== '');
+    const flags: boolean[] = [];
+    let pending = false;
+    for (const t of rawTokens) {
+      const isOp = ['+', '−', '×', '÷', '='].includes(t);
+      const isSuperscript = pending && !isOp;
+      flags.push(isSuperscript);
+      pending = t === '^';
+    }
+    return { tokens: rawTokens, superscriptFlags: flags };
   }, [expression]);
 
   const resultStr = Number.isInteger(result) ? String(result) : result.toFixed(2);
@@ -854,12 +904,16 @@ function EquationText({ expression, result }: { expression: string; result: numb
   return (
     <>
       {tokens.map((t, i) => {
+        if (t === '^') return null;
         const isOp = ['+', '−', '×', '÷', '='].includes(t);
+        const isSuperscript = superscriptFlags[i];
         return (
           <span
             key={i}
             className={
-              isOp
+              isSuperscript
+                ? 'text-pink-500 px-0.5 align-super text-[0.65em] font-black'
+                : isOp
                 ? 'text-purple-500 px-1'
                 : RAINBOW_COLORS[i % RAINBOW_COLORS.length]
             }
@@ -968,13 +1022,16 @@ function HelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
 
               <div>
                 <h3 className="text-lg font-black text-orange-600 mb-1">2. Say a math problem</h3>
-                <p className="font-semibold mb-2">Examples:</p>
+                <p className="font-semibold mb-2">Try simple or tricky ones:</p>
                 <ul className="font-semibold space-y-1 text-sm">
                   <li>• “five plus three”</li>
-                  <li>• “ten minus four”</li>
+                  <li>• “one hundred and fifty minus seventy five”</li>
                   <li>• “six times seven”</li>
-                  <li>• “twenty divided by four”</li>
-                  <li>• “one hundred plus fifty”</li>
+                  <li>• “five squared” or “two cubed”</li>
+                  <li>• “two to the power of three”</li>
+                  <li>• “square root of sixteen”</li>
+                  <li>• “three point one four” (decimals!)</li>
+                  <li>• “five plus three times two” (it knows order)</li>
                 </ul>
               </div>
 
@@ -1071,39 +1128,13 @@ function FloatingDecorations() {
 
 /* ---------- Helpers ---------- */
 
+/** Build the spoken result sentence. ALL numbers — both in the
+ *  expression and in the answer — are converted to words so the
+ *  voice reads them as "five plus three equals eight" rather than
+ *  "5 plus 3 equals eight" (which TTS voices often mispronounce). */
 function spokenResultText(parsed: ParseResult): string {
   if (parsed.result === null) return '';
-  const r = parsed.result;
-  const rStr = Number.isInteger(r) ? numberToWords(r) : r.toFixed(2);
-  return `${parsed.expression.replace(/×/g, 'times').replace(/÷/g, 'divided by').replace(/−/g, 'minus')} equals ${rStr}.`;
-}
-
-const NUM_WORDS_UNDER_100: string[] = [
-  'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
-  'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
-  'seventeen', 'eighteen', 'nineteen',
-];
-const TENS: string[] = [
-  '', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety',
-];
-
-function numberToWords(n: number): string {
-  if (n < 0) return 'negative ' + numberToWords(-n);
-  if (n < 20) return NUM_WORDS_UNDER_100[n];
-  if (n < 100) {
-    const t = Math.floor(n / 10);
-    const r = n % 10;
-    return r === 0 ? TENS[t] : `${TENS[t]} ${NUM_WORDS_UNDER_100[r]}`;
-  }
-  if (n < 1000) {
-    const h = Math.floor(n / 100);
-    const r = n % 100;
-    return r === 0 ? `${NUM_WORDS_UNDER_100[h]} hundred` : `${NUM_WORDS_UNDER_100[h]} hundred ${numberToWords(r)}`;
-  }
-  if (n < 1_000_000) {
-    const th = Math.floor(n / 1000);
-    const r = n % 1000;
-    return r === 0 ? `${numberToWords(th)} thousand` : `${numberToWords(th)} thousand ${numberToWords(r)}`;
-  }
-  return String(n);
+  const spokenExpr = speakExpression(parsed.expression);
+  const spokenResult = speakNumber(parsed.result);
+  return `${spokenExpr} equals ${spokenResult}.`;
 }

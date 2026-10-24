@@ -38,29 +38,65 @@ const NUMBER_WORDS: Record<string, number> = {
 };
 
 const OPERATOR_WORDS: [RegExp, string][] = [
+  // Multi-word phrases first (longest-match-first rule)
   [/\bdivided\s+by\b/g, '/'],
   [/\bdivide\s+by\b/g, '/'],
   [/\bmultiply\s+by\b/g, '*'],
-  [/\btake\s+away\b/g, '-'],
-  [/\bequal\s+to\b/g, '='],
-  [/\bequals\b/g, '='],
-  [/\bequal\b/g, '='],
-  [/\bplus\b/g, '+'],
-  [/\badd\b/g, '+'],
+  [/\bmultiplied\s+by\b/g, '*'],
   [/\badded\s+to\b/g, '+'],
   [/\bsum\s+of\b/g, '+'],
-  [/\bminus\b/g, '-'],
+  [/\btake\s+away\b/g, '-'],
   [/\bsubtract(?:ed)?\b/g, '-'],
+  [/\bequal\s+to\b/g, '='],
+  [/\bequals\b/g, '='],
+  [/\bplus\b/g, '+'],
+  [/\badd\b/g, '+'],
+  [/\bminus\b/g, '-'],
   [/\bless\b/g, '-'],
   [/\btimes\b/g, '*'],
   [/\bmultiply\b/g, '*'],
-  [/\bmultiplied\s+by\b/g, '*'],
   [/\bdivide\b/g, '/'],
   [/\bover\b/g, '/'],
   [/\bdivided\b/g, '/'],
   [/\bmake\b/g, '='],
   [/\bmakes\b/g, '='],
+  [/\bequal\b/g, '='],
 ];
+
+/**
+ * Pre-process special mathematical phrases that don't fit the
+ * simple word→operator substitution model:
+ *   - "square root of X"        → "( X ) ^ 0.5"
+ *   - "X squared"               → "X ^ 2"
+ *   - "X cubed"                 → "X ^ 3"
+ *   - "X to the power of Y"     → "X ^ Y"
+ *   - "X raised to the Y"       → "X ^ Y"
+ *
+ * MUST run AFTER replaceOperators() so all standard operator words
+ * have already become symbols (+, -, *, /, =). The lookaheads detect
+ * operator boundaries with `(?=\s*[+*\/^=()]|$)` — the `\s*` lets the
+ * boundary sit after optional whitespace, so multi-word numbers like
+ * "twenty five" don't break on the internal space.
+ */
+function preprocessSpecials(input: string): string {
+  let t = ' ' + input.toLowerCase() + ' ';
+
+  // "square root of X" / "sqrt of X" / "root of X"
+  // X is captured up to the next operator or end-of-string.
+  const rootRe = /\b(?:square\s+root|sqrt|root)\s+of\s+([a-z0-9\s]+?)(?=\s*[+*/^=()]|$)/g;
+  t = t.replace(rootRe, ' ( $1 ) ^ 0.5 ');
+
+  // "X to the power of Y" / "X power of Y" / "X raised to the Y"
+  t = t.replace(/\bto\s+the\s+power\s+of\b/g, ' ^ ');
+  t = t.replace(/\braised\s+to\s+the\b/g, ' ^ ');
+  t = t.replace(/\bpower\s+of\b/g, ' ^ ');
+
+  // Postfix: "X squared" → "X ^ 2", "X cubed" → "X ^ 3"
+  t = t.replace(/\bsquared\b/g, ' ^ 2 ');
+  t = t.replace(/\bcubed\b/g, ' ^ 3 ');
+
+  return t;
+}
 
 // Repeated digit words (e.g. "double four", "triple nine") — bonus fun.
 const MULTIPLIER_PREFIX: Record<string, number> = {
@@ -88,18 +124,47 @@ function replaceOperators(text: string): string {
 
 /**
  * Tokenise a normalised string into word/number/operator chunks.
- * Splits on whitespace and operator symbols.
+ * Splits on whitespace and operator symbols (including `^` for powers
+ * and parentheses).
  */
 function tokenise(text: string): string[] {
   return text
-    .split(/(\s+|[+\-*/=()])/g)
+    .split(/(\s+|[+\-*/^=()])/g)
     .map((t) => t.trim())
     .filter((t) => t.length > 0);
 }
 
-/** Convert a run of number words into a single integer. */
+/** Convert a run of number words into a single number.
+ *  Supports "and" (ignored) and "point" (decimal separator):
+ *    ["one","hundred","and","fifty"]      → 150
+ *    ["three","point","one","four"]        → 3.14
+ *    ["two","point","five"]                → 2.5
+ */
 function wordsToNumber(words: string[]): number | null {
   if (words.length === 0) return null;
+
+  // Handle decimals: "X point Y Z W" → integer part + fractional digits
+  const pointIdx = words.indexOf('point');
+  if (pointIdx !== -1) {
+    const intWords = words.slice(0, pointIdx);
+    const fracWords = words.slice(pointIdx + 1);
+    let intVal: number | null = 0;
+    if (intWords.length > 0) {
+      intVal = wordsToNumber(intWords);
+      if (intVal === null) return null;
+    }
+    let fracStr = '';
+    for (const raw of fracWords) {
+      const w = raw.replace(/[^a-z]/g, '');
+      if (!(w in NUMBER_WORDS)) return null;
+      const v = NUMBER_WORDS[w];
+      if (v >= 10) return null; // "ten" can't appear in a fractional part
+      fracStr += v;
+    }
+    if (fracStr.length === 0) return null;
+    return parseFloat(`${intVal}.${fracStr}`);
+  }
+
   let total = 0;
   let current = 0;
   let sawNumber = false;
@@ -122,14 +187,17 @@ function wordsToNumber(words: string[]): number | null {
   return sawNumber ? total : null;
 }
 
-/** Shunting-yard evaluator — safe replacement for eval(). */
+/** Shunting-yard evaluator — safe replacement for eval().
+ *  Supports +, -, *, /, ^ (power, right-associative), and parentheses.
+ */
 function safeEval(expression: string): number {
-  const tokens = expression.match(/(\d+(?:\.\d+)?)|[+\-*/()]/g);
+  const tokens = expression.match(/(\d+(?:\.\d+)?)|[+\-*/^()]/g);
   if (!tokens || tokens.length === 0) throw new Error('Empty expression');
 
   const output: (number | string)[] = [];
   const ops: string[] = [];
-  const prec: Record<string, number> = { '+': 1, '-': 1, '*': 2, '/': 2 };
+  const prec: Record<string, number> = { '+': 1, '-': 1, '*': 2, '/': 2, '^': 3 };
+  const rightAssoc: Record<string, boolean> = { '^': true };
 
   let prevToken: string | null = null;
   for (let i = 0; i < tokens.length; i++) {
@@ -152,12 +220,20 @@ function safeEval(expression: string): number {
     if (/^\d/.test(t)) {
       output.push(parseFloat(t));
     } else if (t in prec) {
-      while (
-        ops.length &&
-        ops[ops.length - 1] !== '(' &&
-        prec[ops[ops.length - 1]] >= prec[t]
-      ) {
-        output.push(ops.pop() as string);
+      while (ops.length && ops[ops.length - 1] !== '(') {
+        const topOp = ops[ops.length - 1] as string;
+        const topPrec = prec[topOp];
+        const curPrec = prec[t];
+        // Right-associative: pop only when top has strictly higher precedence.
+        // Left-associative (default): pop when top has >= precedence.
+        const shouldPop = rightAssoc[t]
+          ? topPrec > curPrec
+          : topPrec >= curPrec;
+        if (shouldPop) {
+          output.push(ops.pop() as string);
+        } else {
+          break;
+        }
       }
       ops.push(t);
     } else if (t === '(') {
@@ -196,6 +272,10 @@ function safeEval(expression: string): number {
         case '/':
           if (b === 0) return NaN;
           r = a / b;
+          break;
+        case '^':
+          r = Math.pow(a, b);
+          if (!isFinite(r)) return NaN;
           break;
         default: throw new Error('Unknown operator');
       }
@@ -250,8 +330,14 @@ export function parseSpokenMath(input: string): ParseResult {
     });
   }
 
-  // Replace operator words with symbols.
+  // Replace operator words with symbols FIRST, so the special-phrase
+  // lookaheads in preprocessSpecials can detect operator boundaries
+  // (via `(?=\s*[+*/^=()]|$)`) instead of breaking on internal
+  // whitespace inside multi-word numbers like "twenty five".
   text = replaceOperators(text);
+
+  // Then handle special phrases (square root, squared, cubed, power of).
+  text = preprocessSpecials(text);
 
   // Tokenise.
   const tokens = tokenise(text);
@@ -273,12 +359,12 @@ export function parseSpokenMath(input: string): ParseResult {
   };
 
   for (const token of tokens) {
-    if (/^[+\-*/=()]$/.test(token)) {
+    if (/^[+\-*/^=()]$/.test(token)) {
       flushNumber();
       exprTokens.push(token);
       continue;
     }
-    if (/^\d+(\.\d+)?$/.test(token)) {
+    if (/^\d+(?:\.\d+)?$/.test(token)) {
       flushNumber();
       exprTokens.push(token);
       continue;
@@ -286,6 +372,16 @@ export function parseSpokenMath(input: string): ParseResult {
     const cleaned = token.replace(/[^a-z]/g, '');
     if (cleaned in NUMBER_WORDS) {
       numberBuffer.push(cleaned);
+      continue;
+    }
+    // "and" inside a number phrase (e.g. "one hundred and fifty")
+    // is silently skipped so the surrounding numbers still combine.
+    if (cleaned === 'and') {
+      continue;
+    }
+    // "point" begins a decimal — push to buffer; wordsToNumber handles it.
+    if (cleaned === 'point') {
+      numberBuffer.push('point');
       continue;
     }
     // Unknown word — flush and skip (kids will say "um", "uh", etc.)
@@ -364,4 +460,74 @@ export function speak(text: string, opts?: { rate?: number; pitch?: number }) {
   } catch {
     /* ignore */
   }
+}
+
+const NUM_WORDS_UNDER_100: string[] = [
+  'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+  'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
+  'seventeen', 'eighteen', 'nineteen',
+];
+const TENS: string[] = [
+  '', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety',
+];
+
+/** Convert a non-negative integer (up to 999,999) to spoken English words. */
+export function numberToWords(n: number): string {
+  if (n < 0) return 'negative ' + numberToWords(-n);
+  if (n < 20) return NUM_WORDS_UNDER_100[n];
+  if (n < 100) {
+    const t = Math.floor(n / 10);
+    const r = n % 10;
+    return r === 0 ? TENS[t] : `${TENS[t]} ${NUM_WORDS_UNDER_100[r]}`;
+  }
+  if (n < 1000) {
+    const h = Math.floor(n / 100);
+    const r = n % 100;
+    return r === 0 ? `${NUM_WORDS_UNDER_100[h]} hundred` : `${NUM_WORDS_UNDER_100[h]} hundred ${numberToWords(r)}`;
+  }
+  if (n < 1_000_000) {
+    const th = Math.floor(n / 1000);
+    const r = n % 1000;
+    return r === 0 ? `${numberToWords(th)} thousand` : `${numberToWords(th)} thousand ${numberToWords(r)}`;
+  }
+  return String(n);
+}
+
+/** Speak a decimal number: 3.14 → "three point one four". */
+export function speakDecimal(n: number): string {
+  const s = String(n);
+  if (!s.includes('.')) return numberToWords(n);
+  const [intPart, fracPart] = s.split('.');
+  const intWords = parseInt(intPart, 10) === 0 ? 'zero' : numberToWords(parseInt(intPart, 10));
+  const fracWords = fracPart
+    .split('')
+    .map((d) => NUM_WORDS_UNDER_100[parseInt(d, 10)])
+    .join(' ');
+  return `${intWords} point ${fracWords}`;
+}
+
+/** Speak any number: integers via numberToWords, decimals via speakDecimal. */
+export function speakNumber(n: number): string {
+  if (Number.isInteger(n)) return numberToWords(n);
+  return speakDecimal(n);
+}
+
+/**
+ * Convert a pretty-printed expression like "5 + 3 × 2" or "2 ^ 3 ÷ 4"
+ * into fully-spoken words: "five plus three times two".
+ * Every digit run is converted to words so TTS never reads "5" as
+ * the bare digit "five" inconsistently across voices.
+ */
+export function speakExpression(expression: string): string {
+  return expression
+    .replace(/×/g, ' times ')
+    .replace(/÷/g, ' divided by ')
+    .replace(/−/g, ' minus ')
+    .replace(/\+/g, ' plus ')
+    .replace(/\^/g, ' to the power of ')
+    .replace(/\(/g, ' open parenthesis ')
+    .replace(/\)/g, ' close parenthesis ')
+    .replace(/(\d+(?:\.\d+)?)/g, (m) => ` ${speakNumber(parseFloat(m))} `)
+    .replace(/\s+/g, ' ')
+    .trim();
 }
