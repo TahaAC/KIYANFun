@@ -81,3 +81,29 @@ Stage Summary:
   multi-step expressions with correct operator precedence
 - TTS announces results entirely in words (both expression and answer)
 - Mic button reliably works on second (and Nth) tap via retry loop
+
+---
+Task ID: 5
+Agent: Z.ai main agent
+Task: Auto-refresh after each command
+
+Work Log:
+- Reduced success-path auto-clear timer from 8s to 4s (long enough to read
+  the result + hear the spoken answer, but quick enough to feel responsive)
+- Reduced error-path auto-clear timer from 6s to 3.5s (errors should clear
+  even faster so the kid can try again)
+- Added a 'showReadyPulse' state + visible green-emerald banner that
+  appears at the top of the page the moment the auto-refresh fires,
+  showing 'Ready for the next one!' with a Sparkles icon for ~1.8s
+- resetForNewCommand() now also clears showReadyPulse so a fresh voice
+  session doesn't show a stale 'Ready!' banner
+- Verified in browser: click '5 + 3' -> result '5 + 3 = 8' shows for ~4s
+  -> 'Ready for the next one!' banner appears at top for ~1.8s -> page
+  returns to 'Tap the microphone' ready state
+- tsc + eslint clean; browser console clean
+- Committed 7c1b99a and pushed to TahaAC/KIYANFun main (c5aa682..7c1b99a)
+
+Stage Summary:
+- The system now auto-refreshes back to the ready state ~4s after each
+  command completes (down from 8s), and visibly signals the refresh with
+  a brief 'Ready for the next one!' banner
