@@ -4,7 +4,6 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Mic,
-  MicOff,
   Star,
   Flame,
   Trophy,
@@ -95,7 +94,7 @@ const EXAMPLE_PHRASES: { label: string; text: string }[] = [
   { label: '√16', text: 'square root of sixteen' },
   { label: '3.14', text: 'three point one four' },
   { label: '5 + 3×2', text: 'five plus three times two' },
-  { label: '234', text: 'two hundred and thirty four' },
+  { label: '1,234,567', text: 'one million two hundred thirty four thousand five hundred sixty seven' },
 ];
 
 const RAINBOW_COLORS = [
@@ -448,17 +447,90 @@ export default function Home() {
     // always works.
     const MAX_RETRIES = 4;
     const RETRY_DELAY_MS = 180;
+    // How long to wait after the last final result before parsing the
+    // accumulated transcript. Long enough that the kid can speak a long
+    // multi-word number ("one hundred and twenty three thousand four
+    // hundred and fifty six") without premature parsing; short enough
+    // that the response feels snappy.
+    const SILENCE_DELAY_MS = 1800;
 
     const buildRec = (): SpeechRecognition => {
       const rec = new ctor();
       rec.lang = 'en-US';
-      rec.continuous = false;
+      // CONTINUOUS MODE — keeps the mic open across multiple final results.
+      // This is what lets us accumulate "two hundred" + "and" + "forty
+      // three" into one transcript instead of treating each fragment as
+      // its own command (the cause of "I didn't hear a number" on each
+      // fragment). It's also required for iOS Safari's webkitSpeechRecognition
+      // to keep listening past the first final result.
+      rec.continuous = true;
       rec.interimResults = true;
       rec.maxAlternatives = 3;
+
+      // Session-scoped accumulator for ALL final results within this
+      // listening session. The browser may split a single spoken phrase
+      // into multiple "final" segments at brief pauses — we collect them
+      // all and parse the joined transcript at the end.
+      let accumulated = '';
+      // True once we've called handleResult for this session, so that
+      // onend / a trailing silence timer don't double-process.
+      let parsed = false;
+      // Silence timer — extended every time a new final result arrives,
+      // fires parseAndStop() once the kid has paused speaking.
+      let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const clearSilenceTimer = () => {
+        if (silenceTimer) {
+          clearTimeout(silenceTimer);
+          silenceTimer = null;
+        }
+      };
+
+      // Parse the accumulated transcript and stop the mic.
+      const parseAndStop = () => {
+        clearSilenceTimer();
+        if (parsed) return;
+        parsed = true;
+        const transcript = accumulated.trim();
+        if (!transcript) {
+          // Nothing was said — just stop the mic, onend will clean up.
+          try { rec.stop(); } catch { /* ignore */ }
+          return;
+        }
+        let result = parseSpokenMath(transcript);
+        // If the primary transcript doesn't parse, we can't easily recover
+        // alternates across accumulated segments — just use what we have.
+        if (result.result === null) {
+          // Last-ditch: try the last segment's alternates by themselves.
+          // (Helps when the kid added a stray "um" or "and" at the end.)
+          const segments = transcript.split(/\s+/);
+          if (segments.length > 1) {
+            // Try progressively dropping trailing words
+            for (let drop = 1; drop <= Math.min(3, segments.length - 1); drop++) {
+              const trimmed = segments.slice(0, segments.length - drop).join(' ');
+              const alt = parseSpokenMath(trimmed);
+              if (alt.result !== null) {
+                result = { ...alt, spokenInput: transcript };
+                break;
+              }
+            }
+          }
+        }
+        // Stop the mic first so onend can do its cleanup; then handle the
+        // result. handleResult will queue the spoken answer via
+        // pendingSpeechRef, which onend will speak once the mic is off.
+        try { rec.stop(); } catch { /* ignore */ }
+        handleResult(result, transcript, true);
+      };
 
       rec.onstart = () => {
         // Bail if a newer session has started or this one was cancelled.
         if (sessionIdRef.current !== sessionId) return;
+        // Reset session-scoped state (in case the rec instance is reused
+        // by some browser quirk — shouldn't happen, but safe).
+        accumulated = '';
+        parsed = false;
+        clearSilenceTimer();
         stopRequestedRef.current = false;
         pendingSpeechRef.current = null;
         setListening(true);
@@ -470,41 +542,39 @@ export default function Home() {
       };
 
       rec.onresult = (event: SpeechRecognitionEvent) => {
-        if (sessionIdRef.current !== sessionId) return;
+        if (sessionIdRef.current !== sessionId || parsed) return;
         let interimText = '';
-        let finalEvent: SpeechRecognitionResult | null = null;
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const r = event.results[i];
-          if (r.isFinal && !finalEvent) finalEvent = r;
-          else if (!r.isFinal) interimText += r[0].transcript;
-        }
-        if (interimText) setInterim(interimText);
-        if (finalEvent) {
-          setInterim('');
-          const transcript = finalEvent[0].transcript.trim();
-          // Try each alternative until one parses cleanly — this makes
-          // recognition far more forgiving of misheard words.
-          let parsed = parseSpokenMath(transcript);
-          for (let a = 1; a < finalEvent.length; a++) {
-            if (parsed.result !== null) break;
-            const altParsed = parseSpokenMath(finalEvent[a].transcript.trim());
-            if (altParsed.result !== null) {
-              parsed = { ...altParsed, spokenInput: transcript };
-            }
+          if (r.isFinal) {
+            // Append to the accumulated transcript. The browser may have
+            // split a long phrase into multiple final segments — we join
+            // them with a space so the parser sees the full picture.
+            accumulated += (accumulated ? ' ' : '') + r[0].transcript.trim();
+          } else {
+            interimText += r[0].transcript;
           }
-          handleResult(parsed, transcript, true);
         }
+        // Show "what we've captured so far + what we're still hearing".
+        // This gives the kid live feedback as they speak long numbers.
+        setInterim((accumulated + ' ' + interimText).trim());
+        // Extend the silence timer — parse after the kid pauses.
+        clearSilenceTimer();
+        silenceTimer = setTimeout(parseAndStop, SILENCE_DELAY_MS);
       };
 
       rec.onerror = (event: SpeechRecognitionErrorEvent) => {
         if (sessionIdRef.current !== sessionId) return;
-        setListening(false);
+        clearSilenceTimer();
         if (event.error === 'aborted') {
           return;
         }
         if (stopRequestedRef.current && event.error === 'no-speech') {
           return;
         }
+        // Mark parsed so a trailing onend doesn't double-process.
+        parsed = true;
+        setListening(false);
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           showErrorCard(
             'Microphone is blocked! Ask a grown-up to open this app in a new browser tab, then allow the mic.',
@@ -525,6 +595,21 @@ export default function Home() {
         // Bail if a newer session started. The new session is responsible
         // for its own ref/listening cleanup.
         if (sessionIdRef.current !== sessionId) return;
+        clearSilenceTimer();
+        // If the mic ended before the silence timer fired (e.g., the kid
+        // tapped Stop, or the browser auto-stopped), parse whatever we
+        // accumulated now.
+        if (!parsed) {
+          if (accumulated.trim()) {
+            parseAndStop();
+          } else {
+            // Nothing was said — make sure no stale partial transcript
+            // lingers in the Listening card.
+            setInterim('');
+            setDisplay(null);
+            setMood('idle');
+          }
+        }
         // IMPORTANT: null out the ref HERE, after the browser has fully
         // released the recognizer. Doing it earlier in toggleMic leaves
         // a window where the next start() throws because the engine is
@@ -579,10 +664,13 @@ export default function Home() {
 
   const toggleMic = useCallback(() => {
     if (listening) {
-      // STOP pressed — politely finalise any speech already heard, then
-      // fully refresh the UI for a new command. We do NOT null out
-      // recRef.current here; onend does that once the browser has
-      // fully stopped. This is what makes the next tap work reliably.
+      // STOP pressed — politely tell the recognizer to stop. onend will
+      // then parse whatever the kid said (via parseAndStop) and show the
+      // result. We do NOT resetForNewCommand() here because that would
+      // clear display + mood BEFORE onend has a chance to set them with
+      // the parsed result, causing a brief "Tap the microphone" flash.
+      // We also do NOT null recRef.current here; onend does that once
+      // the browser has fully stopped.
       stopRequestedRef.current = true;
       if (recRef.current) {
         try {
@@ -592,14 +680,15 @@ export default function Home() {
         }
       }
       pendingSpeechRef.current = null;
-      resetForNewCommand();
+      cancelAutoClear();
+      setShowReadyPulse(false);
       setListening(false);
     } else {
       // START pressed — clear any previous result, then listen.
       resetForNewCommand();
       startListening();
     }
-  }, [listening, startListening, resetForNewCommand]);
+  }, [listening, startListening, resetForNewCommand, cancelAutoClear]);
 
   // Quick-example buttons (mouse/keyboard fallback)
   const tryExample = useCallback(
@@ -898,22 +987,35 @@ function ResultCard({
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.95 }}
-            className="w-full rounded-3xl bg-white/80 backdrop-blur border-4 border-orange-300 p-8 text-center shadow-lg"
+            className="w-full rounded-3xl bg-white/85 backdrop-blur border-4 border-orange-300 p-8 text-center shadow-lg relative overflow-hidden"
           >
-            <motion.div
-              animate={{ scale: [1, 1.1, 1] }}
-              transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut' }}
-              className="text-4xl md:text-5xl mb-3"
-              aria-hidden
-            >
-              👂
-            </motion.div>
+            {/* Modern sound-wave visualisation */}
+            <div className="flex items-end justify-center gap-1 h-16 md:h-20 mb-3" aria-hidden>
+              {Array.from({ length: 18 }).map((_, i) => (
+                <motion.span
+                  key={i}
+                  className="w-1.5 md:w-2 rounded-full bg-gradient-to-t from-orange-500 via-pink-500 to-purple-500"
+                  animate={{ height: [8, 40 + ((i * 7) % 30), 14, 50, 10, 8] }}
+                  transition={{
+                    duration: 1 + (i % 5) * 0.08,
+                    repeat: Infinity,
+                    ease: 'easeInOut',
+                    delay: (i % 6) * 0.05,
+                  }}
+                  style={{ height: 12 }}
+                />
+              ))}
+            </div>
             <p className="text-xl md:text-2xl font-black text-orange-600">
               Listening…
             </p>
-            {interim && (
-              <p className="text-base md:text-lg font-bold text-purple-600 mt-2 italic">
+            {interim ? (
+              <p className="text-base md:text-lg font-bold text-purple-600 mt-2 italic break-words">
                 “{interim}”
+              </p>
+            ) : (
+              <p className="text-sm md:text-base font-bold text-purple-500/80 mt-2">
+                Speak a math problem — take your time, I&apos;m listening!
               </p>
             )}
           </motion.div>
@@ -1036,15 +1138,53 @@ function MicButton({
 }) {
   return (
     <div className="relative flex flex-col items-center gap-2">
+      {/* High-tech pulsing rings while listening */}
+      {listening && (
+        <>
+          <motion.span
+            aria-hidden
+            className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-orange-400/70"
+            style={{ width: '8rem', height: '8rem' }}
+            initial={{ scale: 0.65, opacity: 0.7 }}
+            animate={{ scale: [0.65, 1.8, 2.4], opacity: [0.7, 0.3, 0] }}
+            transition={{ duration: 1.6, repeat: Infinity, ease: 'easeOut' }}
+          />
+          <motion.span
+            aria-hidden
+            className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-pink-400/70"
+            style={{ width: '8rem', height: '8rem' }}
+            initial={{ scale: 0.65, opacity: 0.7 }}
+            animate={{ scale: [0.65, 1.8, 2.4], opacity: [0.7, 0.3, 0] }}
+            transition={{ duration: 1.6, repeat: Infinity, ease: 'easeOut', delay: 0.5 }}
+          />
+          <motion.span
+            aria-hidden
+            className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-purple-400/70"
+            style={{ width: '8rem', height: '8rem' }}
+            initial={{ scale: 0.65, opacity: 0.7 }}
+            animate={{ scale: [0.65, 1.8, 2.4], opacity: [0.7, 0.3, 0] }}
+            transition={{ duration: 1.6, repeat: Infinity, ease: 'easeOut', delay: 1.0 }}
+          />
+        </>
+      )}
+
+      {/* Glow halo */}
       <motion.div
+        aria-hidden
         animate={
           listening
-            ? { scale: [1, 1.15, 1] }
-            : { scale: 1 }
+            ? { scale: [1, 1.2, 1], opacity: [0.4, 0.85, 0.4] }
+            : { scale: 1, opacity: 0.5 }
         }
-        transition={{ duration: 0.8, repeat: listening ? Infinity : 0, ease: 'easeInOut' }}
-        className="absolute -inset-3 rounded-full bg-gradient-to-r from-orange-400 to-pink-400 blur-xl opacity-60"
+        transition={{ duration: 1.5, repeat: listening ? Infinity : 0, ease: 'easeInOut' }}
+        className="absolute -inset-4 rounded-full blur-2xl pointer-events-none"
+        style={{
+          background: listening
+            ? 'linear-gradient(135deg, #f97316, #ec4899, #a855f7)'
+            : 'linear-gradient(135deg, #f97316, #ec4899)',
+        }}
       />
+
       <motion.button
         type="button"
         onClick={onClick}
@@ -1054,12 +1194,27 @@ function MicButton({
         aria-label={listening ? 'Stop listening' : 'Tap to speak'}
         className={`relative flex items-center justify-center w-24 h-24 md:w-32 md:h-32 rounded-full text-white shadow-2xl border-4 border-white transition-colors ${
           listening
-            ? 'bg-gradient-to-br from-red-500 to-orange-500'
+            ? 'bg-gradient-to-br from-red-500 via-orange-500 to-pink-500'
             : 'bg-gradient-to-br from-orange-500 to-pink-500'
         } ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
       >
         {listening ? (
-          <MicOff className="w-10 h-10 md:w-14 md:h-14" />
+          // Frequency-bar animation — the modern "voice assistant" look
+          <div className="flex items-center gap-1 h-12 md:h-14" aria-hidden>
+            {[0, 1, 2, 3, 4, 5].map((i) => (
+              <motion.div
+                key={i}
+                className="w-1.5 md:w-2 rounded-full bg-white"
+                animate={{ height: [10, 36, 18, 44, 22, 10] }}
+                transition={{
+                  duration: 0.9,
+                  repeat: Infinity,
+                  ease: 'easeInOut',
+                  delay: i * 0.08,
+                }}
+              />
+            ))}
+          </div>
         ) : (
           <Mic className="w-10 h-10 md:w-14 md:h-14" />
         )}

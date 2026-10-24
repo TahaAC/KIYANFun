@@ -35,6 +35,8 @@ const NUMBER_WORDS: Record<string, number> = {
   ninety: 90,
   hundred: 100,
   thousand: 1000,
+  million: 1_000_000,
+  billion: 1_000_000_000,
 };
 
 const OPERATOR_WORDS: [RegExp, string][] = [
@@ -139,6 +141,12 @@ function tokenise(text: string): string[] {
  *    ["one","hundred","and","fifty"]      → 150
  *    ["three","point","one","four"]        → 3.14
  *    ["two","point","five"]                → 2.5
+ *    ["three","million","two","hundred","thousand"] → 3,200,000
+ *
+ *  Scale-accumulation algorithm: as we walk the words, we keep a `current`
+ *  accumulator and a `total`. Scale words (thousand/million/billion) fold
+ *  `current` into `total` at that scale and reset `current`. "hundred"
+ *  multiplies `current` by 100. Regular number words add to `current`.
  */
 function wordsToNumber(words: string[]): number | null {
   if (words.length === 0) return null;
@@ -165,8 +173,8 @@ function wordsToNumber(words: string[]): number | null {
     return parseFloat(`${intVal}.${fracStr}`);
   }
 
-  let total = 0;
-  let current = 0;
+  let total = 0; // accumulated across scale boundaries (thousand/million/billion)
+  let current = 0; // within the current scale, before the next scale word
   let sawNumber = false;
 
   for (const raw of words) {
@@ -174,10 +182,15 @@ function wordsToNumber(words: string[]): number | null {
     if (!(word in NUMBER_WORDS)) return null;
     const val = NUMBER_WORDS[word];
 
-    if (word === 'hundred' || word === 'thousand') {
-      const base = current === 0 ? 1 : current;
-      current = base * val;
+    if (word === 'hundred') {
+      // "hundred" multiplies the current accumulator (or 1 if empty)
+      current = (current === 0 ? 1 : current) * 100;
+    } else if (word === 'thousand' || word === 'million' || word === 'billion') {
+      // Scale word: fold current into total at this scale, reset current.
+      total += (current === 0 ? 1 : current) * val;
+      current = 0;
     } else {
+      // Regular number word (one through ninety-nine)
       current += val;
     }
     sawNumber = true;
@@ -471,7 +484,7 @@ const TENS: string[] = [
   '', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety',
 ];
 
-/** Convert a non-negative integer (up to 999,999) to spoken English words. */
+/** Convert a non-negative integer (up to 999,999,999,999) to spoken English words. */
 export function numberToWords(n: number): string {
   if (n < 0) return 'negative ' + numberToWords(-n);
   if (n < 20) return NUM_WORDS_UNDER_100[n];
@@ -489,6 +502,16 @@ export function numberToWords(n: number): string {
     const th = Math.floor(n / 1000);
     const r = n % 1000;
     return r === 0 ? `${numberToWords(th)} thousand` : `${numberToWords(th)} thousand ${numberToWords(r)}`;
+  }
+  if (n < 1_000_000_000) {
+    const m = Math.floor(n / 1_000_000);
+    const r = n % 1_000_000;
+    return r === 0 ? `${numberToWords(m)} million` : `${numberToWords(m)} million ${numberToWords(r)}`;
+  }
+  if (n < 1_000_000_000_000) {
+    const b = Math.floor(n / 1_000_000_000);
+    const r = n % 1_000_000_000;
+    return r === 0 ? `${numberToWords(b)} billion` : `${numberToWords(b)} billion ${numberToWords(r)}`;
   }
   return String(n);
 }

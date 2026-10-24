@@ -47,6 +47,14 @@ const CASES: Array<[string, number | string]> = [
   // multi-step
   ['two plus two plus two plus two', 8],
   ['one thousand minus one hundred', 900],
+
+  // large numbers (million / billion support + correct scale-accumulation)
+  ['three million', 3_000_000],
+  ['two thousand three hundred', 2_300],
+  ['three million two hundred thousand', 3_200_000],
+  ['one million two hundred thirty four thousand five hundred sixty seven', 1_234_567],
+  ['nine hundred and ninety nine', 999],
+  ['one thousand and twenty four', 1_024],
 ];
 
 let pass = 0;
