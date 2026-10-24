@@ -107,3 +107,45 @@ Stage Summary:
 - The system now auto-refreshes back to the ready state ~4s after each
   command completes (down from 8s), and visibly signals the refresh with
   a brief 'Ready for the next one!' banner
+
+---
+Task ID: 6
+Agent: Z.ai main agent
+Task: Fix "the mic is not listening" — no visual feedback on tap
+
+Work Log:
+- Root cause #1: The listening state only showed when the browser fired
+  rec.onstart, which is async and can be delayed (especially by the
+  permission prompt on the first tap). Without any visual feedback on
+  tap, the kid thought the mic wasn't listening.
+- Root cause #2: Stale retry timers / handlers from a previous session
+  could fire into the new session — the old 'cancelled' flag from
+  useCallback was dead code (the returned cleanup function is ignored
+  by useCallback, so it never ran).
+- Fix:
+  - startListening() now sets listening=true / mood='listening' /
+    interim='' / display=null IMMEDIATELY (before rec.start() is even
+    called) so the UI shows the listening state on the same tick as
+    the tap. The browser's onstart then confirms (or the optimistic
+    state is reverted by onerror / onend).
+  - Added sessionIdRef + retryTimerRef. Every session bumps a monotonic
+    session ID; stale retry timers and onstart/onerror/onend handlers
+    bail out if the session ID no longer matches.
+  - Retry timer is now cancellable via retryTimerRef so a new session
+    cleanly cancels any pending retry from the prior session.
+  - Added unmount useEffect cleanup that aborts the recognizer and
+    cancels pending timers (helps in dev with hot-reload).
+  - Improved the unsupported-browser banner to mention Chrome/Edge/
+    Safari and HTTPS requirement.
+- Verified in headless browser via console logs: optimistic UI fires
+  on click, rec.start() returns cleanly, onerror/onend fire as
+  expected with no stale-session races.
+- tsc + eslint clean
+- Committed 36f6cc2 and pushed to TahaAC/KIYANFun main (7c1b99a..36f6cc2)
+
+Stage Summary:
+- The mic button now shows the listening state immediately on tap
+  (red button, listening card), even before the browser confirms via
+  onstart. If permission is denied or the recognizer errors out, the
+  error card shows immediately. Stale sessions can no longer interfere
+  with new sessions.
