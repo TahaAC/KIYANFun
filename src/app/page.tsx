@@ -228,6 +228,14 @@ export default function Home() {
   // Set when the user deliberately stops listening, so the trailing
   // 'no-speech' error is suppressed instead of popping an error card.
   const stopRequestedRef = useRef(false);
+  // Monotonic session ID — bumped every time startListening runs. Stale
+  // retry timers and onstart/onend handlers from a previous session bail
+  // out if the session ID no longer matches, so they can't interfere
+  // with the new session.
+  const sessionIdRef = useRef(0);
+  // Tracks the pending setTimeout for a start() retry so a new session
+  // can cancel it cleanly instead of letting stale retries fire.
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Helper that writes to localStorage and notifies subscribers.
   const updateSaved = useCallback((updater: (prev: SavedState) => SavedState) => {
@@ -268,6 +276,29 @@ export default function Home() {
     }, 3500);
     return () => clearInterval(t);
   }, [mood]);
+
+  // Cleanup on unmount: abort any in-flight recognizer, cancel pending
+  // retry timers and pending auto-clear. Without this, hot-reload during
+  // development can leave dangling SpeechRecognition sessions running.
+  useEffect(() => {
+    return () => {
+      if (recRef.current) {
+        try { recRef.current.abort(); } catch { /* ignore */ }
+        recRef.current = null;
+      }
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+      if (autoClearRef.current) {
+        clearTimeout(autoClearRef.current);
+        autoClearRef.current = null;
+      }
+      // Bump session ID so any in-flight async handlers from this
+      // session bail out gracefully.
+      sessionIdRef.current++;
+    };
+  }, []);
 
   // Cancel any pending auto-clear timer.
   const cancelAutoClear = useCallback(() => {
@@ -390,15 +421,33 @@ export default function Home() {
       }
       recRef.current = null;
     }
+    // Cancel any pending retry from a previous session.
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    // Bump session ID so any in-flight retries / handlers from a prior
+    // session bail out — they can't interfere with this new session.
+    const sessionId = ++sessionIdRef.current;
+
+    // OPTIMISTIC UI: show the listening state IMMEDIATELY so the kid sees
+    // that the tap registered. The browser's `onstart` is async and can
+    // be delayed (especially the first tap, while the permission prompt
+    // is open). Without this, the kid taps the mic and the UI shows
+    // nothing happened for a moment → "the mic is not listening".
+    setListening(true);
+    setMood('listening');
+    setInterim('');
+    setDisplay(null);
+    stopRequestedRef.current = false;
+    pendingSpeechRef.current = null;
 
     // Some browsers throw from start() when it's called too quickly after
     // a previous stop() — the underlying recognizer hasn't released yet.
     // Retry a few times with a short delay so the second (and Nth) tap
-    // always works. This is the root cause of the "I can't tap the mic
-    // a second time" complaint.
-    const MAX_RETRIES = 3;
-    const RETRY_DELAY_MS = 220;
-    let cancelled = false;
+    // always works.
+    const MAX_RETRIES = 4;
+    const RETRY_DELAY_MS = 180;
 
     const buildRec = (): SpeechRecognition => {
       const rec = new ctor();
@@ -408,18 +457,20 @@ export default function Home() {
       rec.maxAlternatives = 3;
 
       rec.onstart = () => {
+        // Bail if a newer session has started or this one was cancelled.
+        if (sessionIdRef.current !== sessionId) return;
         stopRequestedRef.current = false;
         pendingSpeechRef.current = null;
         setListening(true);
         setMood('listening');
         setInterim('');
-        // Clear the previous result so the "Listening…" card is always visible.
         setDisplay(null);
         // NOTE: no TTS here on purpose — speaking while the mic is open makes
         // the recognizer hear the app's own voice.
       };
 
       rec.onresult = (event: SpeechRecognitionEvent) => {
+        if (sessionIdRef.current !== sessionId) return;
         let interimText = '';
         let finalEvent: SpeechRecognitionResult | null = null;
         for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -446,6 +497,7 @@ export default function Home() {
       };
 
       rec.onerror = (event: SpeechRecognitionErrorEvent) => {
+        if (sessionIdRef.current !== sessionId) return;
         setListening(false);
         if (event.error === 'aborted') {
           return;
@@ -470,6 +522,9 @@ export default function Home() {
       };
 
       rec.onend = () => {
+        // Bail if a newer session started. The new session is responsible
+        // for its own ref/listening cleanup.
+        if (sessionIdRef.current !== sessionId) return;
         // IMPORTANT: null out the ref HERE, after the browser has fully
         // released the recognizer. Doing it earlier in toggleMic leaves
         // a window where the next start() throws because the engine is
@@ -490,7 +545,7 @@ export default function Home() {
     };
 
     const tryStart = (retriesLeft: number) => {
-      if (cancelled) return;
+      if (sessionIdRef.current !== sessionId) return;
       const rec = buildRec();
       try {
         rec.start();
@@ -498,22 +553,28 @@ export default function Home() {
       } catch {
         // Browser hasn't released the previous recognizer yet — retry.
         if (retriesLeft > 0) {
-          setTimeout(() => tryStart(retriesLeft - 1), RETRY_DELAY_MS);
-        } else {
-          setListening(false);
-          showErrorCard(
-            'The mic is taking a moment to wake up. Tap the mic again!'
+          retryTimerRef.current = setTimeout(
+            () => {
+              retryTimerRef.current = null;
+              tryStart(retriesLeft - 1);
+            },
+            RETRY_DELAY_MS
           );
+        } else {
+          // All retries exhausted — revert the optimistic UI and tell
+          // the user the mic needs another tap.
+          if (sessionIdRef.current === sessionId) {
+            setListening(false);
+            setMood('idle');
+            showErrorCard(
+              'The mic is taking a moment to wake up. Tap the mic again!'
+            );
+          }
         }
       }
     };
 
     tryStart(MAX_RETRIES);
-
-    // Best-effort cleanup if the component unmounts during retries.
-    return () => {
-      cancelled = true;
-    };
   }, [handleResult, showErrorCard]);
 
   const toggleMic = useCallback(() => {
@@ -711,8 +772,8 @@ export default function Home() {
 
       {/* Unsupported browser banner */}
       {micDisabled && (
-        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 bg-white/95 backdrop-blur px-4 py-2 rounded-full text-sm font-bold text-orange-600 border-2 border-orange-300 shadow-lg">
-          Voice input isn’t available here — use the example buttons below!
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 bg-white/95 backdrop-blur px-4 py-2 rounded-full text-sm font-bold text-orange-600 border-2 border-orange-300 shadow-lg text-center max-w-[90%]">
+          Voice input isn&apos;t available here. Try Chrome, Edge, or Safari — and make sure the site is loaded over HTTPS. Or use the example buttons below!
         </div>
       )}
 
