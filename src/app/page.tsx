@@ -445,92 +445,82 @@ export default function Home() {
     // a previous stop() — the underlying recognizer hasn't released yet.
     // Retry a few times with a short delay so the second (and Nth) tap
     // always works.
-    const MAX_RETRIES = 4;
-    const RETRY_DELAY_MS = 180;
+    const MAX_RETRIES = 8;
+    const RETRY_DELAY_MS = 250;
     // How long to wait after the last final result before parsing the
     // accumulated transcript. Long enough that the kid can speak a long
     // multi-word number ("one hundred and twenty three thousand four
     // hundred and fifty six") without premature parsing; short enough
     // that the response feels snappy.
     const SILENCE_DELAY_MS = 1800;
+    // Watchdog: if the browser doesn't fire onend within this long after
+    // we call rec.stop(), force the cleanup ourselves. With continuous=true,
+    // onend can be unreliable in some browsers (iOS Safari in particular),
+    // and if we don't clean up, `listening` stays true and the next tap
+    // goes into the STOP branch instead of START — making the user think
+    // "the mic doesn't work a second time".
+    const ONEND_WATCHDOG_MS = 800;
 
     const buildRec = (): SpeechRecognition => {
       const rec = new ctor();
       rec.lang = 'en-US';
-      // CONTINUOUS MODE — keeps the mic open across multiple final results.
-      // This is what lets us accumulate "two hundred" + "and" + "forty
-      // three" into one transcript instead of treating each fragment as
-      // its own command (the cause of "I didn't hear a number" on each
-      // fragment). It's also required for iOS Safari's webkitSpeechRecognition
-      // to keep listening past the first final result.
-      rec.continuous = true;
+      // CONTINUOUS=FALSE — each tap captures ONE spoken phrase. This is
+      // simpler and more reliable than continuous=true (which can leave
+      // the recognizer in a "paused" state that prevents the next
+      // start() from succeeding on some browsers, causing the "mic
+      // only works the first time" complaint).
+      // For multi-word numbers like "two hundred and forty three", the
+      // browser's voice-activity detection typically treats the whole
+      // spoken phrase as one final segment (finalizing only after a
+      // ~1-2s pause). The parser then handles the joined transcript.
+      rec.continuous = false;
       rec.interimResults = true;
       rec.maxAlternatives = 3;
 
-      // Session-scoped accumulator for ALL final results within this
-      // listening session. The browser may split a single spoken phrase
-      // into multiple "final" segments at brief pauses — we collect them
-      // all and parse the joined transcript at the end.
-      let accumulated = '';
       // True once we've called handleResult for this session, so that
-      // onend / a trailing silence timer don't double-process.
+      // onend / a trailing handler don't double-process.
       let parsed = false;
-      // Silence timer — extended every time a new final result arrives,
-      // fires parseAndStop() once the kid has paused speaking.
-      let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+      // True once we've done the full cleanup (nulled recRef, set
+      // listening=false, spoken queued text). Prevents double-cleanup.
+      let cleanedUp = false;
+      // Watchdog timer — started when we call rec.stop() or when onend
+      // should fire. If onend doesn't fire within ONEND_WATCHDOG_MS,
+      // we force the cleanup ourselves. This is the safety net for
+      // browsers where onend is unreliable.
+      let onendWatchdog: ReturnType<typeof setTimeout> | null = null;
 
-      const clearSilenceTimer = () => {
-        if (silenceTimer) {
-          clearTimeout(silenceTimer);
-          silenceTimer = null;
+      const clearOnendWatchdog = () => {
+        if (onendWatchdog) {
+          clearTimeout(onendWatchdog);
+          onendWatchdog = null;
         }
       };
 
-      // Parse the accumulated transcript and stop the mic.
-      const parseAndStop = () => {
-        clearSilenceTimer();
-        if (parsed) return;
-        parsed = true;
-        const transcript = accumulated.trim();
-        if (!transcript) {
-          // Nothing was said — just stop the mic, onend will clean up.
-          try { rec.stop(); } catch { /* ignore */ }
-          return;
+      // Run the post-listening cleanup: null the recRef, set
+      // listening=false, speak any queued text. Idempotent — safe to
+      // call from both handleResult-path and onend.
+      const doCleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        clearOnendWatchdog();
+        if (recRef.current === rec) recRef.current = null;
+        setListening(false);
+        stopRequestedRef.current = false;
+        setMood((m) => (m === 'listening' ? 'idle' : m));
+        // The mic is fully off now — speak anything queued during the session.
+        const queued = pendingSpeechRef.current;
+        pendingSpeechRef.current = null;
+        if (queued) {
+          setTimeout(() => speak(queued, { pitch: 1.3, rate: 0.95 }), 250);
         }
-        let result = parseSpokenMath(transcript);
-        // If the primary transcript doesn't parse, we can't easily recover
-        // alternates across accumulated segments — just use what we have.
-        if (result.result === null) {
-          // Last-ditch: try the last segment's alternates by themselves.
-          // (Helps when the kid added a stray "um" or "and" at the end.)
-          const segments = transcript.split(/\s+/);
-          if (segments.length > 1) {
-            // Try progressively dropping trailing words
-            for (let drop = 1; drop <= Math.min(3, segments.length - 1); drop++) {
-              const trimmed = segments.slice(0, segments.length - drop).join(' ');
-              const alt = parseSpokenMath(trimmed);
-              if (alt.result !== null) {
-                result = { ...alt, spokenInput: transcript };
-                break;
-              }
-            }
-          }
-        }
-        // Stop the mic first so onend can do its cleanup; then handle the
-        // result. handleResult will queue the spoken answer via
-        // pendingSpeechRef, which onend will speak once the mic is off.
-        try { rec.stop(); } catch { /* ignore */ }
-        handleResult(result, transcript, true);
       };
 
       rec.onstart = () => {
         // Bail if a newer session has started or this one was cancelled.
         if (sessionIdRef.current !== sessionId) return;
-        // Reset session-scoped state (in case the rec instance is reused
-        // by some browser quirk — shouldn't happen, but safe).
-        accumulated = '';
         parsed = false;
-        clearSilenceTimer();
+        cleanedUp = false;
+        clearOnendWatchdog();
         stopRequestedRef.current = false;
         pendingSpeechRef.current = null;
         setListening(true);
@@ -544,86 +534,90 @@ export default function Home() {
       rec.onresult = (event: SpeechRecognitionEvent) => {
         if (sessionIdRef.current !== sessionId || parsed) return;
         let interimText = '';
+        let finalEvent: SpeechRecognitionResult | null = null;
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const r = event.results[i];
-          if (r.isFinal) {
-            // Append to the accumulated transcript. The browser may have
-            // split a long phrase into multiple final segments — we join
-            // them with a space so the parser sees the full picture.
-            accumulated += (accumulated ? ' ' : '') + r[0].transcript.trim();
-          } else {
-            interimText += r[0].transcript;
-          }
+          if (r.isFinal && !finalEvent) finalEvent = r;
+          else if (!r.isFinal) interimText += r[0].transcript;
         }
-        // Show "what we've captured so far + what we're still hearing".
-        // This gives the kid live feedback as they speak long numbers.
-        setInterim((accumulated + ' ' + interimText).trim());
-        // Extend the silence timer — parse after the kid pauses.
-        clearSilenceTimer();
-        silenceTimer = setTimeout(parseAndStop, SILENCE_DELAY_MS);
+        if (interimText) setInterim(interimText);
+        if (finalEvent) {
+          parsed = true;
+          setInterim('');
+          const transcript = finalEvent[0].transcript.trim();
+          // Try each alternative until one parses cleanly — this makes
+          // recognition far more forgiving of misheard words.
+          let result = parseSpokenMath(transcript);
+          for (let a = 1; a < finalEvent.length; a++) {
+            if (result.result !== null) break;
+            const altParsed = parseSpokenMath(finalEvent[a].transcript.trim());
+            if (altParsed.result !== null) {
+              result = { ...altParsed, spokenInput: transcript };
+            }
+          }
+          // If nothing parsed, try progressively dropping trailing words
+          // (helps when the kid added a stray "um" or "and" at the end).
+          if (result.result === null) {
+            const segments = transcript.split(/\s+/);
+            if (segments.length > 1) {
+              for (let drop = 1; drop <= Math.min(3, segments.length - 1); drop++) {
+                const trimmed = segments.slice(0, segments.length - drop).join(' ');
+                const alt = parseSpokenMath(trimmed);
+                if (alt.result !== null) {
+                  result = { ...alt, spokenInput: transcript };
+                  break;
+                }
+              }
+            }
+          }
+          // Politely stop the mic (allowing pending results to finalize),
+          // then handle the result. onend (or the watchdog) will do the
+          // full cleanup.
+          try { rec.stop(); } catch { /* ignore */ }
+          // Watchdog: if onend doesn't fire within ONEND_WATCHDOG_MS,
+          // force the cleanup ourselves so the user can tap the mic again.
+          onendWatchdog = setTimeout(doCleanup, ONEND_WATCHDOG_MS);
+          handleResult(result, transcript, true);
+        }
       };
 
       rec.onerror = (event: SpeechRecognitionErrorEvent) => {
         if (sessionIdRef.current !== sessionId) return;
-        clearSilenceTimer();
-        if (event.error === 'aborted') {
-          return;
-        }
-        if (stopRequestedRef.current && event.error === 'no-speech') {
-          return;
-        }
-        // Mark parsed so a trailing onend doesn't double-process.
+        if (event.error === 'aborted') return;
+        if (stopRequestedRef.current && event.error === 'no-speech') return;
         parsed = true;
-        setListening(false);
-        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-          showErrorCard(
-            'Microphone is blocked! Ask a grown-up to open this app in a new browser tab, then allow the mic.',
-            'mic-blocked'
-          );
-        } else if (event.error === 'no-speech') {
-          showErrorCard("I didn't hear anything — tap the mic and try again!");
-        } else if (event.error === 'network') {
-          showErrorCard(
-            'The speech service is not reachable right now. Try again, or use the buttons below!'
-          );
-        } else {
-          showErrorCard(`Oops: ${event.error}. Try again!`);
-        }
+        showErrorCard(
+          event.error === 'not-allowed' || event.error === 'service-not-allowed'
+            ? 'Microphone is blocked! Ask a grown-up to open this app in a new browser tab, then allow the mic.'
+            : event.error === 'no-speech'
+            ? "I didn't hear anything — tap the mic and try again!"
+            : event.error === 'network'
+            ? 'The speech service is not reachable right now. Try again, or use the buttons below!'
+            : `Oops: ${event.error}. Try again!`,
+          event.error === 'not-allowed' || event.error === 'service-not-allowed'
+            ? 'mic-blocked'
+            : undefined
+        );
+        // Force cleanup so the user can tap the mic again.
+        doCleanup();
       };
 
       rec.onend = () => {
         // Bail if a newer session started. The new session is responsible
         // for its own ref/listening cleanup.
         if (sessionIdRef.current !== sessionId) return;
-        clearSilenceTimer();
-        // If the mic ended before the silence timer fired (e.g., the kid
-        // tapped Stop, or the browser auto-stopped), parse whatever we
-        // accumulated now.
+        // If we got a final result and called handleResult, the watchdog
+        // is pending. doCleanup will speak the queued text. If onend
+        // fires first, doCleanup runs here (idempotent).
+        // If we didn't get a final result and the mic just ended (e.g.,
+        // user clicked Stop without speaking), make sure no stale partial
+        // transcript lingers.
         if (!parsed) {
-          if (accumulated.trim()) {
-            parseAndStop();
-          } else {
-            // Nothing was said — make sure no stale partial transcript
-            // lingers in the Listening card.
-            setInterim('');
-            setDisplay(null);
-            setMood('idle');
-          }
+          setInterim('');
+          setDisplay(null);
+          setMood('idle');
         }
-        // IMPORTANT: null out the ref HERE, after the browser has fully
-        // released the recognizer. Doing it earlier in toggleMic leaves
-        // a window where the next start() throws because the engine is
-        // still tearing down.
-        if (recRef.current === rec) recRef.current = null;
-        setListening(false);
-        stopRequestedRef.current = false;
-        setMood((m) => (m === 'listening' ? 'idle' : m));
-        // The mic is fully off now — speak anything queued during the session.
-        const queued = pendingSpeechRef.current;
-        pendingSpeechRef.current = null;
-        if (queued) {
-          setTimeout(() => speak(queued, { pitch: 1.3, rate: 0.95 }), 250);
-        }
+        doCleanup();
       };
 
       return rec;
@@ -669,8 +663,12 @@ export default function Home() {
       // result. We do NOT resetForNewCommand() here because that would
       // clear display + mood BEFORE onend has a chance to set them with
       // the parsed result, causing a brief "Tap the microphone" flash.
-      // We also do NOT null recRef.current here; onend does that once
-      // the browser has fully stopped.
+      // We also do NOT null recRef.current here; onend/doCleanup does
+      // that once the browser has fully stopped.
+      // We also do NOT clear pendingSpeechRef here — if the silence
+      // timer already fired and queued speech via handleResult, clearing
+      // it now would lose the spoken answer. doCleanup (called from
+      // onend or the watchdog) handles speaking and clearing.
       stopRequestedRef.current = true;
       if (recRef.current) {
         try {
@@ -679,7 +677,6 @@ export default function Home() {
           /* ignore */
         }
       }
-      pendingSpeechRef.current = null;
       cancelAutoClear();
       setShowReadyPulse(false);
       setListening(false);
