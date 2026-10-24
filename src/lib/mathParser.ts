@@ -344,11 +344,12 @@ export function parseSpokenMath(input: string): ParseResult {
   };
 }
 
-/** Speak a sentence using the browser's speech synthesis. */
+/** Speak a sentence using the browser's speech synthesis.
+ *  Utterances are queued (not cancelled) so back-to-back messages like a
+ *  result followed by a streak celebration play in order. */
 export function speak(text: string, opts?: { rate?: number; pitch?: number }) {
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
   try {
-    window.speechSynthesis.cancel();
     const utter = new SpeechSynthesisUtterance(text);
     utter.rate = opts?.rate ?? 0.95;
     utter.pitch = opts?.pitch ?? 1.2;

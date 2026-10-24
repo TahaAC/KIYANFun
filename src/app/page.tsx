@@ -210,6 +210,17 @@ export default function Home() {
   const [showLevelUp, setShowLevelUp] = useState<string | null>(null);
   const [hintIndex, setHintIndex] = useState(0);
   const recRef = useRef<SpeechRecognition | null>(null);
+  // Speech is queued here during a voice session and spoken only AFTER the
+  // recognition session has fully ended. Speaking while the mic is open makes
+  // the recognizer transcribe the app's own voice — a major source of
+  // "recognition not working" complaints.
+  const pendingSpeechRef = useRef<string | null>(null);
+  // Auto-returns the result card to the ready state so the app is always
+  // fresh for the next command.
+  const autoClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Set when the user deliberately stops listening, so the trailing
+  // 'no-speech' error is suppressed instead of popping an error card.
+  const stopRequestedRef = useRef(false);
 
   // Helper that writes to localStorage and notifies subscribers.
   const updateSaved = useCallback((updater: (prev: SavedState) => SavedState) => {
@@ -251,21 +262,57 @@ export default function Home() {
     return () => clearInterval(t);
   }, [mood]);
 
+  // Cancel any pending auto-clear timer.
+  const cancelAutoClear = useCallback(() => {
+    if (autoClearRef.current) {
+      clearTimeout(autoClearRef.current);
+      autoClearRef.current = null;
+    }
+  }, []);
+
+  // Full reset so the next voice command starts from a clean slate.
+  const resetForNewCommand = useCallback(() => {
+    cancelAutoClear();
+    setDisplay(null);
+    setInterim('');
+    setMood('idle');
+  }, [cancelAutoClear]);
+
+  // Show a friendly error card, then auto-refresh to the ready state.
+  const showErrorCard = useCallback(
+    (message: string, error?: string) => {
+      cancelAutoClear();
+      setMood('oops');
+      setDisplay({ expression: '', result: null, message, transcript: '', error });
+      autoClearRef.current = setTimeout(() => {
+        setDisplay(null);
+        setInterim('');
+        setMood((m) => (m === 'oops' ? 'idle' : m));
+      }, 6000);
+    },
+    [cancelAutoClear]
+  );
+
   const handleResult = useCallback(
-    (parsed: ParseResult, transcript: string) => {
-      if (parsed.result === null || parsed.expression === '') {
-        setMood('oops');
-        setDisplay({
-          expression: '',
-          result: null,
-          message: parsed.error ?? "I didn't hear that!",
-          transcript,
-          error: parsed.error,
-        });
-        setStreak(0);
-        if (!muted) {
-          speak(parsed.error ?? "Oops! Try again, buddy!", { pitch: 1.3 });
+    (parsed: ParseResult, transcript: string, fromVoice: boolean) => {
+      cancelAutoClear();
+
+      // Queue speech (voice path) or speak immediately (button path).
+      const say = (text: string) => {
+        if (muted) return;
+        if (fromVoice) {
+          pendingSpeechRef.current = pendingSpeechRef.current
+            ? `${pendingSpeechRef.current} ${text}`
+            : text;
+        } else {
+          speak(text, { pitch: 1.3, rate: 0.95 });
         }
+      };
+
+      if (parsed.result === null || parsed.expression === '') {
+        setStreak(0);
+        showErrorCard(parsed.error ?? "I didn't hear that!", parsed.error);
+        say(parsed.error ?? 'Oops! Try again, buddy!');
         return;
       }
 
@@ -279,6 +326,9 @@ export default function Home() {
       setMood('happy');
       setConfettiRun((r) => r + 1);
 
+      // Speak the result (queued until the mic is off for voice input).
+      say(spokenResultText(parsed));
+
       // Gamification: +10 per correct solve, +streak bonus.
       // Persist score / bestStreak / solved via localStorage.
       const newStreak = streak + 1;
@@ -291,22 +341,24 @@ export default function Home() {
       // Level-up celebration every 5 streak
       if (newStreak > 0 && newStreak % 5 === 0) {
         setShowLevelUp(`Streak ${newStreak}! 🔥`);
-        if (!muted) speak(`Wow! Streak of ${newStreak}! You are a math star!`, { pitch: 1.4 });
+        say(`Wow! Streak of ${newStreak}! You are a math star!`);
         setTimeout(() => setShowLevelUp(null), 2500);
       }
 
-      // Speak the result
-      if (!muted) {
-        const spoken = spokenResultText(parsed);
-        setTimeout(() => speak(`${message} ${spoken}`, { pitch: 1.3, rate: 0.95 }), 150);
-      }
+      // Auto-refresh back to the ready state shortly after the celebration,
+      // so the next command always starts clean.
+      autoClearRef.current = setTimeout(() => {
+        setDisplay(null);
+        setInterim('');
+        setMood((m) => (m === 'happy' ? 'idle' : m));
+      }, 8000);
 
       // Return to idle after a beat
       setTimeout(() => {
         setMood((m) => (m === 'happy' ? 'idle' : m));
       }, 2200);
     },
-    [streak, muted, updateSaved]
+    [streak, muted, updateSaved, cancelAutoClear, showErrorCard]
   );
 
   const startListening = useCallback(() => {
@@ -328,65 +380,82 @@ export default function Home() {
     rec.lang = 'en-US';
     rec.continuous = false;
     rec.interimResults = true;
-    rec.maxAlternatives = 1;
+    rec.maxAlternatives = 3;
 
     rec.onstart = () => {
+      stopRequestedRef.current = false;
+      pendingSpeechRef.current = null;
       setListening(true);
       setMood('listening');
       setInterim('');
-      if (!muted) speak("I'm listening!", { rate: 1.1, pitch: 1.4 });
+      // Clear the previous result so the "Listening…" card is always visible.
+      setDisplay(null);
+      // NOTE: no TTS here on purpose — speaking while the mic is open makes
+      // the recognizer hear the app's own voice.
     };
 
     rec.onresult = (event: SpeechRecognitionEvent) => {
-      let final = '';
       let interimText = '';
+      let finalEvent: SpeechRecognitionResult | null = null;
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const r = event.results[i];
-        if (r.isFinal) final += r[0].transcript;
-        else interimText += r[0].transcript;
+        if (r.isFinal && !finalEvent) finalEvent = r;
+        else if (!r.isFinal) interimText += r[0].transcript;
       }
       if (interimText) setInterim(interimText);
-      if (final) {
+      if (finalEvent) {
         setInterim('');
-        const parsed = parseSpokenMath(final);
-        handleResult(parsed, final.trim());
+        const transcript = finalEvent[0].transcript.trim();
+        // Try each alternative until one parses cleanly — this makes
+        // recognition far more forgiving of misheard words.
+        let parsed = parseSpokenMath(transcript);
+        for (let a = 1; a < finalEvent.length; a++) {
+          if (parsed.result !== null) break;
+          const altParsed = parseSpokenMath(finalEvent[a].transcript.trim());
+          if (altParsed.result !== null) {
+            parsed = { ...altParsed, spokenInput: transcript };
+          }
+        }
+        handleResult(parsed, transcript, true);
       }
     };
 
     rec.onerror = (event: SpeechRecognitionErrorEvent) => {
-      setMood('oops');
       setListening(false);
+      if (event.error === 'aborted') {
+        // User cancelled — UI already reset, stay quiet.
+        return;
+      }
+      if (stopRequestedRef.current && event.error === 'no-speech') {
+        // Deliberate stop with nothing said — keep the clean refreshed state.
+        return;
+      }
       if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-        setDisplay({
-          expression: '',
-          result: null,
-          message: 'Microphone is blocked. Please allow it in your browser!',
-          transcript: '',
-          error: 'mic-blocked',
-        });
+        showErrorCard(
+          'Microphone is blocked! Ask a grown-up to open this app in a new browser tab, then allow the mic.',
+          'mic-blocked'
+        );
       } else if (event.error === 'no-speech') {
-        setDisplay({
-          expression: '',
-          result: null,
-          message: "I didn't hear anything — try again!",
-          transcript: '',
-        });
-      } else if (event.error === 'aborted') {
-        // ignore
+        showErrorCard("I didn't hear anything — tap the mic and try again!");
+      } else if (event.error === 'network') {
+        showErrorCard(
+          'The speech service is not reachable right now. Try again, or use the buttons below!'
+        );
       } else {
-        setDisplay({
-          expression: '',
-          result: null,
-          message: `Oops: ${event.error}. Try again!`,
-          transcript: '',
-        });
+        showErrorCard(`Oops: ${event.error}. Try again!`);
       }
     };
 
     rec.onend = () => {
       setListening(false);
-      restartRef.current = false;
+      stopRequestedRef.current = false;
       setMood((m) => (m === 'listening' ? 'idle' : m));
+      // The mic is fully off now — speak anything queued during the session.
+      const queued = pendingSpeechRef.current;
+      pendingSpeechRef.current = null;
+      if (queued) {
+        setTimeout(() => speak(queued, { pitch: 1.3, rate: 0.95 }), 250);
+      }
     };
 
     try {
@@ -396,32 +465,51 @@ export default function Home() {
       // Some browsers throw if start() is called too rapidly
       setListening(false);
     }
-  }, [handleResult, muted]);
-
-  const stopListening = useCallback(() => {
-    if (recRef.current) {
-      try {
-        recRef.current.stop();
-      } catch {
-        /* ignore */
-      }
-    }
-    setListening(false);
-  }, []);
+  }, [handleResult, cancelAutoClear, showErrorCard]);
 
   const toggleMic = useCallback(() => {
-    if (listening) stopListening();
-    else startListening();
-  }, [listening, startListening, stopListening]);
+    if (listening) {
+      // STOP pressed — finish the session and fully refresh for a new command.
+      stopRequestedRef.current = true;
+      if (recRef.current) {
+        try {
+          // stop() politely finalises any speech already heard (so nothing
+          // the kid said is lost); the UI below resets immediately.
+          recRef.current.stop();
+        } catch {
+          /* ignore */
+        }
+        recRef.current = null;
+      }
+      pendingSpeechRef.current = null;
+      resetForNewCommand();
+      setListening(false);
+    } else {
+      // START pressed — clear any previous result, then listen.
+      resetForNewCommand();
+      startListening();
+    }
+  }, [listening, startListening, resetForNewCommand]);
 
-  // Manual entry fallback (typing)
+  // Quick-example buttons (mouse/keyboard fallback)
   const tryExample = useCallback(
     (phrase: string) => {
-      setMood('thinking');
+      // If a voice session is somehow still open, close it quietly first.
+      if (listening && recRef.current) {
+        stopRequestedRef.current = true;
+        try {
+          recRef.current.abort();
+        } catch {
+          /* ignore */
+        }
+        recRef.current = null;
+        setListening(false);
+      }
+      pendingSpeechRef.current = null;
       const parsed = parseSpokenMath(phrase);
-      handleResult(parsed, phrase);
+      handleResult(parsed, phrase, false);
     },
-    [handleResult]
+    [listening, handleResult]
   );
 
   const resetProgress = useCallback(() => {
@@ -893,7 +981,8 @@ function HelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
               <div>
                 <h3 className="text-lg font-black text-green-600 mb-1">3. Hear the answer!</h3>
                 <p className="font-semibold">
-                  The robot reads the answer out loud and throws a confetti party. 🎉
+                  The robot reads the answer out loud and throws a confetti party. 🎉 Then it
+                  gets ready for your next question automatically!
                 </p>
               </div>
 
@@ -906,7 +995,8 @@ function HelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
 
               <div className="bg-amber-50 border-2 border-amber-200 rounded-2xl p-3">
                 <p className="font-bold text-amber-700 text-sm">
-                  💡 Tip: Speak clearly and not too fast. If the mic is blocked, use the example buttons instead!
+                  💡 Tips: Speak clearly and not too fast. Tap the mic again while listening to
+                  stop and start fresh. If the mic is blocked, use the example buttons instead!
                 </p>
               </div>
             </div>
