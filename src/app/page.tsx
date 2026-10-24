@@ -212,6 +212,9 @@ export default function Home() {
   const [muted, setMuted] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [showLevelUp, setShowLevelUp] = useState<string | null>(null);
+  // Briefly true after the auto-refresh fires — pulses a "Ready!" banner
+  // so the kid sees that the system has refreshed itself for the next command.
+  const [showReadyPulse, setShowReadyPulse] = useState(false);
   const [hintIndex, setHintIndex] = useState(0);
   const recRef = useRef<SpeechRecognition | null>(null);
   // Speech is queued here during a voice session and spoken only AFTER the
@@ -280,6 +283,7 @@ export default function Home() {
     setDisplay(null);
     setInterim('');
     setMood('idle');
+    setShowReadyPulse(false);
   }, [cancelAutoClear]);
 
   // Show a friendly error card, then auto-refresh to the ready state.
@@ -291,8 +295,10 @@ export default function Home() {
       autoClearRef.current = setTimeout(() => {
         setDisplay(null);
         setInterim('');
-        setMood((m) => (m === 'oops' ? 'idle' : m));
-      }, 6000);
+        setMood('idle');
+        setShowReadyPulse(true);
+        setTimeout(() => setShowReadyPulse(false), 1800);
+      }, 3500);
     },
     [cancelAutoClear]
   );
@@ -350,12 +356,17 @@ export default function Home() {
       }
 
       // Auto-refresh back to the ready state shortly after the celebration,
-      // so the next command always starts clean.
+      // so the next command always starts clean. 4s is long enough to read
+      // the result + hear the spoken answer, but quick enough to feel like
+      // the system is refreshing itself for the next command.
       autoClearRef.current = setTimeout(() => {
         setDisplay(null);
         setInterim('');
-        setMood((m) => (m === 'happy' ? 'idle' : m));
-      }, 8000);
+        setMood('idle');
+        // Pulse a "Ready!" banner so the refresh is visible to the kid.
+        setShowReadyPulse(true);
+        setTimeout(() => setShowReadyPulse(false), 1800);
+      }, 4000);
 
       // Return to idle after a beat
       setTimeout(() => {
@@ -594,6 +605,24 @@ export default function Home() {
             className="fixed top-6 left-1/2 -translate-x-1/2 z-40 bg-gradient-to-r from-orange-500 to-pink-500 text-white px-6 py-3 rounded-full text-xl md:text-2xl font-black shadow-2xl border-4 border-white"
           >
             {showLevelUp}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Auto-refresh pulse — appears briefly when the system has just
+          refreshed itself for the next command. */}
+      <AnimatePresence>
+        {showReadyPulse && !showLevelUp && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.6, y: -40 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.6, y: -40 }}
+            className="fixed top-6 left-1/2 -translate-x-1/2 z-40 bg-gradient-to-r from-green-500 to-emerald-500 text-white px-6 py-3 rounded-full text-lg md:text-xl font-black shadow-2xl border-4 border-white"
+          >
+            <span className="inline-flex items-center gap-2">
+              <Sparkles className="w-5 h-5" />
+              Ready for the next one!
+            </span>
           </motion.div>
         )}
       </AnimatePresence>
